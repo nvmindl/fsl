@@ -2,15 +2,7 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const cheerio = require("cheerio");
 require("dotenv").config();
 
-let gotScraping;
-// Dynamic import for ESM-only got-scraping
-async function getGot() {
-  if (!gotScraping) {
-    const mod = await import("got-scraping");
-    gotScraping = mod.gotScraping;
-  }
-  return gotScraping;
-}
+
 
 // ── Caches ──
 const cache = {
@@ -39,7 +31,7 @@ function cacheSet(store, key, data) {
 // ── FaselHD Domain Rotation ──
 const DOMAIN_BASE = "faselhdx.best";
 const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
-let activeDomain = process.env.FASELHDX_DOMAIN || "https://web3170x.faselhdx.best";
+let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31712x.faselhdx.best";
 let domainLastCheck = 0;
 const DOMAIN_TTL = 30 * 60 * 1000;
 let domainDiscoveryPromise = null;
@@ -57,14 +49,12 @@ async function discoverDomain() {
   // fasel-hd.cam/wp-admin/admin-ajax.php redirects to the active subdomain
   for (const fallback of FALLBACK_DOMAINS) {
     try {
-      const got = await getGot();
-      const { headers: resHeaders } = await got({
-        url: `${fallback}/wp-admin/admin-ajax.php`,
-        headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
-        timeout: { request: 6000 },
-        followRedirect: false,
+      const resp = await fetch(`${fallback}/wp-admin/admin-ajax.php`, {
+        headers: HEADERS,
+        redirect: "manual",
+        signal: AbortSignal.timeout(6000),
       });
-      const loc = resHeaders?.location || "";
+      const loc = resp.headers.get("location") || "";
       const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.best/);
       if (m) {
         const candidate = m[0].replace(/^http:/, "https:");
@@ -112,15 +102,12 @@ async function discoverDomain() {
 
 async function testDomain(domain) {
   try {
-    const got = await getGot();
-    const { body, statusCode } = await got({
-      url: `${domain}/`,
-      headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
-      timeout: { request: 8000 },
-      followRedirect: true,
-      maxRedirects: 3,
+    const resp = await fetch(`${domain}/`, {
+      headers: HEADERS,
+      signal: AbortSignal.timeout(8000),
     });
-    if (statusCode === 200) {
+    if (resp.ok) {
+      const body = await resp.text();
       return !body.includes("Just a moment") && !body.includes("Checking your browser");
     }
     return false;
@@ -168,16 +155,13 @@ async function fetchPage(url, retries = 2) {
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
-      const got = await getGot();
-      const { body: html, statusCode } = await got({
-        url,
-        headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
-        timeout: { request: 15000 },
-        followRedirect: true,
-        maxRedirects: 5,
+      const resp = await fetch(url, {
+        headers: { ...HEADERS, Referer: url },
+        signal: AbortSignal.timeout(15000),
       });
 
-      if (statusCode !== 200) throw new Error(`HTTP ${statusCode}`);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const html = await resp.text();
 
       if (html.includes("Just a moment") || html.includes("Checking your browser")) {
         console.log("[Fetch] Cloudflare challenge");
@@ -201,14 +185,11 @@ async function getImdbInfo(imdbId) {
   if (cached) return cached;
   try {
     const url = `https://v2.sg.media-imdb.com/suggestion/t/${imdbId}.json`;
-    const got = await getGot();
-    const { body, statusCode } = await got({
-      url,
-      timeout: { request: 5000 },
-      responseType: "json",
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(5000),
     });
-    if (statusCode !== 200) return null;
-    const data = body;
+    if (!resp.ok) return null;
+    const data = await resp.json();
     if (data.d && data.d.length > 0) {
       const info = { title: data.d[0].l, year: data.d[0].y };
       cacheSet(cache.imdb, imdbId, info);
