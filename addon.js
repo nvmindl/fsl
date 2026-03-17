@@ -107,8 +107,17 @@ async function browserFetch(url, timeout = 45000) {
     }
 
     const html = await page.content();
+    const finalUrl = page.url();
     const status = response ? response.status() : 0;
     console.log(`[Browser] ${url.substring(0, 60)}... → ${status} (${html.length} chars)`);
+
+    // Detect domain rotation: if we were redirected to a different domain
+    if (url.includes(DOMAIN_BASE) && !finalUrl.includes(DOMAIN_BASE)) {
+      console.log(`[Browser] Domain rotated! ${url} → ${finalUrl}`);
+      markDomainBad();
+      return null;
+    }
+
     return html;
   } catch (err) {
     console.error(`[Browser] Error: ${err.message}`);
@@ -148,7 +157,7 @@ const DOMAIN_BASE = "faselhdx";
 const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
 let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31718x.faselhdx.best";
 let domainLastCheck = Date.now(); // Trust configured domain on startup
-const DOMAIN_TTL = 30 * 60 * 1000;
+const DOMAIN_TTL = 15 * 60 * 1000;
 let domainDiscoveryPromise = null;
 
 async function discoverDomain() {
@@ -185,29 +194,54 @@ async function discoverDomain() {
     }
   }
 
-  // FALLBACK: Scan nearby numbers from last known
+  // FALLBACK: Scan nearby numbers from last known — all in parallel for speed
   console.log("[Domain] Redirect method failed, scanning...");
   const numMatch = activeDomain.match(/web(\d+)x/);
   const lastNum = numMatch ? parseInt(numMatch[1]) : 31718;
 
-  for (let base = -5; base <= 100; base += 10) {
-    const batch = [];
-    for (let i = 0; i < 10 && base + i <= 100; i++) {
-      batch.push(lastNum + base + i);
+  // Build all candidates at once
+  const candidates = [];
+  for (let offset = -5; offset <= 100; offset++) {
+    for (const tld of ['best', 'xyz']) {
+      candidates.push(`https://web${lastNum + offset}x.${DOMAIN_BASE}.${tld}`);
     }
-    const results = await Promise.all(
-      batch.map(async (num) => {
-        const domain = `https://web${num}x.${DOMAIN_BASE}.best`;
-        return (await testDomain(domain)) ? domain : null;
-      })
-    );
-    const found = results.find(Boolean);
-    if (found) {
-      activeDomain = found;
-      domainLastCheck = Date.now();
-      console.log(`[Domain] Discovered via scan: ${activeDomain}`);
-      return activeDomain;
-    }
+  }
+  console.log(`[Domain] Scanning ${candidates.length} candidates from web${lastNum - 5}x to web${lastNum + 100}x...`);
+
+  // Test all in parallel with short timeout
+  const scanResults = await Promise.all(
+    candidates.map(async (domain) => {
+      try {
+        const resp = await fetch(`${domain}/feed`, {
+          headers: { "User-Agent": UA },
+          redirect: "manual",
+          signal: AbortSignal.timeout(4000),
+        });
+        if (resp.status >= 300 && resp.status < 400) {
+          const loc = resp.headers.get("location") || "";
+          if (!loc.startsWith(domain)) return null; // rotated away
+          const resp2 = await fetch(loc, { headers: { "User-Agent": UA }, redirect: "manual", signal: AbortSignal.timeout(4000) });
+          if (resp2.ok) {
+            const text = await resp2.text();
+            if (text.includes("<channel") || text.includes("<rss")) return domain;
+          }
+          return null;
+        }
+        if (resp.ok) {
+          const text = await resp.text();
+          if (text.includes("<channel") || text.includes("<rss")) return domain;
+        }
+      } catch {}
+      return null;
+    })
+  );
+
+  const found = scanResults.find(Boolean);
+  if (found) {
+    activeDomain = found;
+    domainLastCheck = Date.now();
+    console.log(`[Domain] Discovered via scan: ${activeDomain}`);
+    return activeDomain;
   }
 
   console.log("[Domain] Could not discover active domain, using last known");
@@ -218,13 +252,28 @@ async function discoverDomain() {
 async function testDomain(domain) {
   try {
     // Use redirect:'manual' to detect 301 (domain moved)
-    const resp = await fetch(`${domain}/feed/`, {
+    const resp = await fetch(`${domain}/feed`, {
       headers: { "User-Agent": UA },
       redirect: "manual",
       signal: AbortSignal.timeout(8000),
     });
-    // 301/302 means domain rotated away
-    if (resp.status >= 300 && resp.status < 400) return false;
+    // 301 to a different domain means domain rotated away
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get("location") || "";
+      // Self-redirect (e.g. /feed/ → /feed) is OK — follow it
+      if (loc.startsWith(domain)) {
+        const resp2 = await fetch(loc, {
+          headers: { "User-Agent": UA },
+          redirect: "manual",
+          signal: AbortSignal.timeout(5000),
+        });
+        if (resp2.ok) {
+          const text = await resp2.text();
+          return text.includes("<channel") || text.includes("<rss");
+        }
+      }
+      return false;
+    }
     if (resp.ok) {
       const text = await resp.text();
       // RSS feed should contain channel/rss tags
@@ -277,6 +326,21 @@ async function fetchPage(url, retries = 2) {
       // Use Puppeteer for FaselHD pages, native fetch for others
       let html;
       if (url.includes(DOMAIN_BASE)) {
+        // Quick check: is the domain still alive? (native fetch, no browser needed)
+        try {
+          const checkResp = await fetch(url, {
+            redirect: "manual",
+            headers: { "User-Agent": UA },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (checkResp.status >= 300 && checkResp.status < 400) {
+            console.log(`[Fetch] Domain returned ${checkResp.status}, rotating...`);
+            markDomainBad();
+            const newDomain = await getDomain();
+            url = url.replace(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/, newDomain);
+            console.log(`[Fetch] Retrying with new domain: ${url}`);
+          }
+        } catch {}
         html = await browserFetch(url);
       } else {
         const resp = await fetch(url, {
@@ -377,14 +441,21 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   let found = false;
 
   // Fetch all sitemaps in parallel, process results as they arrive
+  let domainDead = false;
   const fetches = [];
   for (let i = 1; i <= maxNum; i++) {
     fetches.push(
       fetch(`${domain}/${prefix}-sitemap${i}.xml`, {
         headers: { "User-Agent": UA },
+        redirect: "manual",
         signal: AbortSignal.timeout(12000),
       })
         .then(async (resp) => {
+          // Detect domain rotation (301/302 redirect)
+          if (resp.status >= 300 && resp.status < 400) {
+            domainDead = true;
+            return;
+          }
           if (!resp.ok || found) return;
           const xml = await resp.text();
           if (xml.includes("Just a moment")) return;
@@ -399,6 +470,17 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
     );
   }
   await Promise.all(fetches);
+
+  // If domain rotated, trigger re-discovery and retry with new domain
+  if (domainDead && allResults.length === 0) {
+    console.log(`[Sitemap] Domain ${domain} rotated, discovering new one...`);
+    markDomainBad();
+    const newDomain = await getDomain();
+    if (newDomain !== domain) {
+      console.log(`[Sitemap] Retrying with ${newDomain}`);
+      return searchSitemaps(newDomain, prefix, maxNum, slug, year);
+    }
+  }
 
   // If no exact year match but we have results, that's fine
   if (allResults.length === 0 && !found) return [];
