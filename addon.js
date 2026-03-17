@@ -146,7 +146,7 @@ function cacheSet(store, key, data) {
 // ── FaselHD Domain Rotation ──
 const DOMAIN_BASE = "faselhdx";
 const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
-let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31712x.faselhdx.best";
+let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31718x.faselhdx.best";
 let domainLastCheck = Date.now(); // Trust configured domain on startup
 const DOMAIN_TTL = 30 * 60 * 1000;
 let domainDiscoveryPromise = null;
@@ -188,11 +188,11 @@ async function discoverDomain() {
   // FALLBACK: Scan nearby numbers from last known
   console.log("[Domain] Redirect method failed, scanning...");
   const numMatch = activeDomain.match(/web(\d+)x/);
-  const lastNum = numMatch ? parseInt(numMatch[1]) : 3170;
+  const lastNum = numMatch ? parseInt(numMatch[1]) : 31718;
 
-  for (let base = -5; base <= 50; base += 10) {
+  for (let base = -5; base <= 100; base += 10) {
     const batch = [];
-    for (let i = 0; i < 10 && base + i <= 50; i++) {
+    for (let i = 0; i < 10 && base + i <= 100; i++) {
       batch.push(lastNum + base + i);
     }
     const results = await Promise.all(
@@ -217,24 +217,21 @@ async function discoverDomain() {
 
 async function testDomain(domain) {
   try {
-    // Try native fetch on sitemap (no browser needed, bypasses CF)
-    const resp = await fetch(`${domain}/sitemap_index.xml`, {
+    // Use redirect:'manual' to detect 301 (domain moved)
+    const resp = await fetch(`${domain}/feed/`, {
       headers: { "User-Agent": UA },
+      redirect: "manual",
       signal: AbortSignal.timeout(8000),
     });
+    // 301/302 means domain rotated away
+    if (resp.status >= 300 && resp.status < 400) return false;
     if (resp.ok) {
       const text = await resp.text();
-      if (text.includes("<sitemapindex") && text.length > 500) return true;
+      // RSS feed should contain channel/rss tags
+      if (text.includes("<channel") || text.includes("<rss")) return true;
     }
   } catch {}
-  // Fallback: try browser fetch on root page
-  try {
-    const html = await browserFetch(`${domain}/`, 10000);
-    if (!html) return false;
-    return !html.includes("Just a moment") && !html.includes("Checking your browser") && html.length > 1000;
-  } catch {
-    return false;
-  }
+  return false;
 }
 
 async function getDomain() {
