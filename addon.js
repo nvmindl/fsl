@@ -956,10 +956,15 @@ const server = http.createServer(async (req, res) => {
   }, 120000);
   res.on("finish", () => clearTimeout(requestTimeout));
   // ── M3U8/segment proxy (bypasses IP-locked streams) ──
-  if (req.url.startsWith("/proxy/")) {
-    // URL format: /proxy/{base64url}/{filename}
-    const pathParts = req.url.split('/');
-    const b64 = pathParts[2]; // the base64url-encoded target URL
+  // Supports both: /proxy/{base64url}/stream.m3u8 and /proxy?url={base64url}
+  if (req.url.startsWith("/proxy")) {
+    let b64;
+    if (req.url.startsWith("/proxy/")) {
+      b64 = req.url.split('/')[2];
+    } else {
+      const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+      b64 = parsedUrl.searchParams.get("url");
+    }
     if (!b64) {
       res.writeHead(400, { "Content-Type": "text/plain" });
       res.end("Missing url parameter");
