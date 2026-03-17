@@ -2,6 +2,16 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const cheerio = require("cheerio");
 require("dotenv").config();
 
+let gotScraping;
+// Dynamic import for ESM-only got-scraping
+async function getGot() {
+  if (!gotScraping) {
+    const mod = await import("got-scraping");
+    gotScraping = mod.gotScraping;
+  }
+  return gotScraping;
+}
+
 // ── Caches ──
 const cache = {
   imdb: new Map(),    // imdbId → { title, year, ts }
@@ -47,16 +57,14 @@ async function discoverDomain() {
   // fasel-hd.cam/wp-admin/admin-ajax.php redirects to the active subdomain
   for (const fallback of FALLBACK_DOMAINS) {
     try {
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(`${fallback}/wp-admin/admin-ajax.php`, {
-        method: "GET",
-        headers: HEADERS,
-        redirect: "manual",
-        signal: controller.signal,
+      const got = await getGot();
+      const { headers: resHeaders } = await got({
+        url: `${fallback}/wp-admin/admin-ajax.php`,
+        headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
+        timeout: { request: 6000 },
+        followRedirect: false,
       });
-      clearTimeout(tid);
-      const loc = res.headers.get("location") || "";
+      const loc = resHeaders?.location || "";
       const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.best/);
       if (m) {
         const candidate = m[0].replace(/^http:/, "https:");
@@ -104,19 +112,15 @@ async function discoverDomain() {
 
 async function testDomain(domain) {
   try {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`${domain}/`, {
-      method: "GET",
-      headers: HEADERS,
-      redirect: "manual",
-      signal: controller.signal,
+    const got = await getGot();
+    const { body, statusCode } = await got({
+      url: `${domain}/`,
+      headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
+      timeout: { request: 6000 },
+      followRedirect: false,
     });
-    clearTimeout(tid);
-    if (res.status === 200) {
-      const text = await res.text();
-      // Make sure it's not a Cloudflare challenge
-      return !text.includes("Just a moment") && !text.includes("Checking your browser");
+    if (statusCode === 200) {
+      return !body.includes("Just a moment") && !body.includes("Checking your browser");
     }
     return false;
   } catch {
@@ -163,18 +167,16 @@ async function fetchPage(url, retries = 2) {
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 12000);
-
-      const res = await fetch(url, {
-        headers: HEADERS,
-        redirect: "follow",
-        signal: controller.signal,
+      const got = await getGot();
+      const { body: html, statusCode } = await got({
+        url,
+        headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
+        timeout: { request: 15000 },
+        followRedirect: true,
+        maxRedirects: 5,
       });
-      clearTimeout(tid);
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const html = await res.text();
+      if (statusCode !== 200) throw new Error(`HTTP ${statusCode}`);
 
       if (html.includes("Just a moment") || html.includes("Checking your browser")) {
         console.log("[Fetch] Cloudflare challenge");
@@ -198,15 +200,14 @@ async function getImdbInfo(imdbId) {
   if (cached) return cached;
   try {
     const url = `https://v2.sg.media-imdb.com/suggestion/t/${imdbId}.json`;
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(url, {
-      headers: { "User-Agent": UA },
-      signal: controller.signal,
+    const got = await getGot();
+    const { body, statusCode } = await got({
+      url,
+      timeout: { request: 5000 },
+      responseType: "json",
     });
-    clearTimeout(tid);
-    if (!res.ok) return null;
-    const data = await res.json();
+    if (statusCode !== 200) return null;
+    const data = body;
     if (data.d && data.d.length > 0) {
       const info = { title: data.d[0].l, year: data.d[0].y };
       cacheSet(cache.imdb, imdbId, info);
