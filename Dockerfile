@@ -1,10 +1,8 @@
 FROM node:20-slim
 
-# Install Chromium and dependencies for Puppeteer
+# Install Chromium and minimal dependencies for Puppeteer
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
-    fonts-noto-color-emoji \
-    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # Tell Puppeteer to use installed Chromium
