@@ -792,61 +792,60 @@ builder.defineStreamHandler(async ({ type, id }) => {
 // ── Server ──
 
 const PORT = parseInt(process.env.PORT) || 27828;
-const http = require("http");
-const { getRouter } = require("stremio-addon-sdk");
 
-const addonInterface = builder.getInterface();
+// Use serveHTTP for Stremio compatibility, then add custom endpoints
+serveHTTP(builder.getInterface(), { port: PORT }).then(({ url, server }) => {
+  // Intercept requests to add custom routes before Stremio handles them
+  const originalListeners = server.listeners("request").slice();
+  server.removeAllListeners("request");
 
-const server = http.createServer(async (req, res) => {
-  // Health/debug endpoint
-  if (req.url === "/health") {
-    const fs = require("fs");
-    const chromiumExists = fs.existsSync(CHROME_PATH);
-    const info = {
-      status: "ok",
-      domain: activeDomain,
-      domainAge: Date.now() - domainLastCheck,
-      cfCookies: cfCookies ? cfCookies.substring(0, 80) + "..." : "none",
-      cfCookieAge: cfCookieTs ? Date.now() - cfCookieTs : null,
-      chromiumPath: CHROME_PATH,
-      chromiumExists,
-      nodeVersion: process.version,
-      memoryMB: Math.round(process.memoryUsage.rss ? process.memoryUsage().rss / 1048576 : 0),
-    };
-    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-    res.end(JSON.stringify(info, null, 2));
-    return;
-  }
-
-  // Test CF harvest endpoint
-  if (req.url === "/test-cf") {
-    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-    try {
-      cfCookieTs = 0; // Force re-harvest
-      const cookies = await harvestCfCookies(`${activeDomain}/`);
-      res.end(JSON.stringify({ success: true, cookies: cookies.substring(0, 200) }));
-    } catch (err) {
-      res.end(JSON.stringify({ success: false, error: err.message }));
+  server.on("request", async (req, res) => {
+    // Health/debug endpoint
+    if (req.url === "/health") {
+      const fs = require("fs");
+      const chromiumExists = fs.existsSync(CHROME_PATH);
+      const info = {
+        status: "ok",
+        domain: activeDomain,
+        domainAge: Date.now() - domainLastCheck,
+        cfCookies: cfCookies ? cfCookies.substring(0, 80) + "..." : "none",
+        cfCookieAge: cfCookieTs ? Date.now() - cfCookieTs : null,
+        chromiumPath: CHROME_PATH,
+        chromiumExists,
+        nodeVersion: process.version,
+        memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+      };
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(info, null, 2));
+      return;
     }
-    return;
-  }
 
-  // Default: Stremio addon router
-  const router = getRouter(addonInterface);
-  router(req, res, () => {
-    res.writeHead(404);
-    res.end();
+    // Test CF harvest endpoint
+    if (req.url === "/test-cf") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      try {
+        cfCookieTs = 0;
+        const cookies = await harvestCfCookies(`${activeDomain}/`);
+        res.end(JSON.stringify({ success: true, cookies: cookies.substring(0, 200) }));
+      } catch (err) {
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+      return;
+    }
+
+    // Pass to Stremio SDK handler
+    for (const listener of originalListeners) {
+      listener.call(server, req, res);
+    }
   });
-});
 
-server.listen(PORT, () => {
   console.log("=".repeat(55));
   console.log("  FaselHD Stremio Addon");
   console.log("=".repeat(55));
-  console.log(`  Server:   http://localhost:${PORT}`);
-  console.log(`  Manifest: http://localhost:${PORT}/manifest.json`);
-  console.log(`  Health:   http://localhost:${PORT}/health`);
-  console.log(`  Test:     http://localhost:${PORT}/stream/movie/tt6166392.json`);
+  console.log(`  Server:   ${url}`);
+  console.log(`  Manifest: ${url}/manifest.json`);
+  console.log(`  Health:   ${url}/health`);
+  console.log(`  Test:     ${url}/stream/movie/tt6166392.json`);
   console.log("=".repeat(55));
 });
 
