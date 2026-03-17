@@ -52,8 +52,17 @@ async function getBrowser() {
   return browserLaunchPromise;
 }
 
+// Simple mutex: only 1 browser page at a time to prevent OOM on free tier
+let browserQueue = Promise.resolve();
+function withBrowserLock(fn) {
+  const p = browserQueue.then(fn, fn);
+  browserQueue = p.catch(() => {});
+  return p;
+}
+
 // Fetch a page using Puppeteer (bypasses CF)
 async function browserFetch(url, timeout = 45000) {
+  return withBrowserLock(async () => {
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
@@ -107,6 +116,7 @@ async function browserFetch(url, timeout = 45000) {
   } finally {
     await page.close().catch(() => {});
   }
+  }); // end withBrowserLock
 }
 
 // ── Caches ──
@@ -966,6 +976,15 @@ const server = http.createServer(async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
 
+  // Global request timeout: 120s max per request
+  const requestTimeout = setTimeout(() => {
+    if (!res.writableEnded) {
+      console.log(`[TIMEOUT] Request timed out: ${req.url}`);
+      res.writeHead(504, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request timed out" }));
+    }
+  }, 120000);
+  res.on("finish", () => clearTimeout(requestTimeout));
   // Health/debug endpoint
   if (req.url === "/health") {
     const fs = require("fs");
@@ -979,103 +998,43 @@ const server = http.createServer(async (req, res) => {
       chromiumExists,
       nodeVersion: process.version,
       memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+      sitemapUrls: {
+        movies: sitemapCache.movies.length,
+        seasons: sitemapCache.seasons.length,
+        series: sitemapCache.series.length,
+        age: sitemapCache.ts ? Date.now() - sitemapCache.ts : null,
+      },
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(info, null, 2));
     return;
   }
 
-  // Test browser fetch endpoint
-  if (req.url === "/test-cf") {
-    try {
-      const html = await browserFetch(`${activeDomain}/?s=Inception`, 25000);
-      const $ = cheerio.load(html || "");
-      const results = $(".postDiv").length;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: !!html,
-        length: html ? html.length : 0,
-        searchResults: results,
-        hasCfChallenge: html ? html.includes("Just a moment") : null,
-        preview: html ? html.substring(0, 300) : null,
-      }));
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, error: err.message }));
-    }
-    return;
-  }
-
-  // Diagnostic: test sitemap search + direct page access from this server
-  if (req.url === "/diag") {
+  // Quick sitemap test (no browser, fast)
+  if (req.url === "/test-sitemap") {
     const results = {};
-
-    // Test 1: Sitemap fetch (native fetch, no browser needed)
     try {
       const smUrl = `${activeDomain}/movies-sitemap3.xml`;
-      const smResp = await fetch(smUrl, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15000) });
-      const smXml = await smResp.text();
-      const smCf = smXml.includes("Just a moment");
-      const smUrls = [...smXml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1]);
-      const inception = smUrls.filter(u => u.toLowerCase().includes("inception"));
-      results.test1_sitemap_nativeFetch = {
-        status: smResp.status,
-        length: smXml.length,
-        cf: smCf,
-        urlCount: smUrls.length,
-        inceptionFound: inception.length > 0,
-        inceptionUrl: inception[0] || null,
-      };
-    } catch (e) { results.test1_sitemap_nativeFetch = { error: e.message }; }
+      const r = await fetch(smUrl, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15000) });
+      const xml = await r.text();
+      const cf = xml.includes("Just a moment");
+      const urls = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1]);
+      const inception = urls.filter(u => u.toLowerCase().includes("inception"));
+      results.sitemapFetch = { status: r.status, length: xml.length, cf, urlCount: urls.length, inception: inception[0] || null };
+    } catch (e) { results.sitemapFetch = { error: e.message }; }
 
-    // Test 2: Full sitemap search for "Inception"
     try {
       const sm = await getSitemaps();
-      const slug = slugify("Inception");
-      const movieResults = searchSitemapUrls(sm.movies, slug, 2010);
-      results.test2_sitemapSearch = {
-        movieCount: sm.movies.length,
-        seasonCount: sm.seasons.length,
-        seriesCount: sm.series.length,
-        searchSlug: slug,
-        found: movieResults.length,
-        urls: movieResults.slice(0, 3).map(r => r.url),
+      const movieResults = searchSitemapUrls(sm.movies, "inception", 2010);
+      const seriesResults = searchSitemapUrls(sm.seasons, "breaking-bad", null);
+      results.search = {
+        totalMovies: sm.movies.length,
+        totalSeasons: sm.seasons.length,
+        totalSeries: sm.series.length,
+        inceptionFound: movieResults.slice(0, 2).map(r => r.url),
+        breakingBadFound: seriesResults.slice(0, 2).map(r => r.url),
       };
-    } catch (e) { results.test2_sitemapSearch = { error: e.message }; }
-
-    // Test 3: Direct movie page via browser
-    try {
-      const browser = await getBrowser();
-      const inceptionUrl = results.test1_sitemap_nativeFetch?.inceptionUrl || `${activeDomain}/movies/1-1%d9%81%d9%8a%d9%84%d9%85-inception-2010-%d9%85%d8%aa%d8%b1%d8%ac%d9%85-lk`;
-      const page = await browser.newPage();
-      await page.setUserAgent(UA);
-      await page.setViewport({ width: 1920, height: 1080 });
-      await page.goto(inceptionUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
-      const html = await page.content();
-      results.test3_directPage_browser = {
-        length: html.length,
-        cf: html.includes("Just a moment"),
-        hasPlayerToken: html.includes("player_token"),
-        title: (html.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
-      };
-      await page.close();
-    } catch (e) { results.test3_directPage_browser = { error: e.message }; }
-
-    // Test 4: Series sitemap search for "Breaking Bad"
-    try {
-      const sm = await getSitemaps();
-      const slug = slugify("Breaking Bad");
-      const seasonResults = searchSitemapUrls(sm.seasons, slug, null);
-      const seriesResults = searchSitemapUrls(sm.series, slug, null);
-      results.test4_seriesSearch = {
-        searchSlug: slug,
-        seasonsFound: seasonResults.length,
-        seriesFound: seriesResults.length,
-        seasonUrls: seasonResults.slice(0, 3).map(r => r.url),
-        seriesUrls: seriesResults.slice(0, 3).map(r => r.url),
-      };
-    } catch (e) { results.test4_seriesSearch = { error: e.message }; }
+    } catch (e) { results.search = { error: e.message }; }
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(results, null, 2));
