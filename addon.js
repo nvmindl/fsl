@@ -306,26 +306,59 @@ async function getPlayerTokens(url) {
   return tokens;
 }
 
-// Get episode URLs from a series page
-async function getEpisodes(url) {
+// Parse a series page: extract season URLs and episode URLs
+async function parseSeriesPage(url) {
   const html = await fetchPage(url);
-  if (!html) return [];
+  if (!html) return { seasons: [], episodes: [] };
 
   const $ = cheerio.load(html);
   const domain = new URL(url).origin;
-  const episodes = [];
 
-  // FaselHD episode links
-  $("a[href]").each((_, el) => {
+  // Extract seasons from .seasonDiv onclick handlers
+  const seasons = [];
+  $(".seasonDiv").each((_, el) => {
+    const title = $(el).find(".title").text().trim();
+    const onclick = $(el).attr("onclick") || "";
+    // "موسم 1" → extract number
+    const numMatch = title.match(/(\d+)/);
+    const sn = numMatch ? parseInt(numMatch[1]) : 0;
+    // onclick="window.location.href = '/?p=212588'"
+    const urlMatch = onclick.match(/['"]([^'"]+)['"]/);
+    const seasonUrl = urlMatch
+      ? urlMatch[1].startsWith("http")
+        ? urlMatch[1]
+        : `${domain}${urlMatch[1]}`
+      : "";
+    if (seasonUrl) seasons.push({ num: sn, url: seasonUrl, title });
+  });
+
+  // Extract episode links
+  const episodes = [];
+  const seen = new Set();
+  // Prefer .epAll container, fall back to any episode link
+  const epLinks = $(".epAll a[href]").length
+    ? $(".epAll a[href]")
+    : $('a[href*="episode"]');
+  epLinks.each((_, el) => {
     const href = $(el).attr("href") || "";
     const text = $(el).text().trim();
-    if (href.includes("/episode/")) {
+    if (
+      (href.includes("episode") || href.includes("%d8%a7%d9%84%d8%ad%d9%84%d9%82%d8%a9")) &&
+      !seen.has(href)
+    ) {
+      seen.add(href);
       const full = href.startsWith("http") ? href : `${domain}${href}`;
-      episodes.push({ url: full, title: text });
+      // Extract episode number from Arabic "الحلقة N" or URL
+      const numMatch = text.match(/(\d+)/) || href.match(/-(\d+)(?:[-%]|$)/);
+      const epNum = numMatch ? parseInt(numMatch[1]) : 0;
+      episodes.push({ url: full, title: text, num: epNum });
     }
   });
 
-  return episodes;
+  console.log(
+    `[Series] ${seasons.length} season(s), ${episodes.length} episode(s)`
+  );
+  return { seasons, episodes };
 }
 
 // ── Stream extraction from video_player page ──
@@ -505,9 +538,26 @@ async function resolve(imdbId, type, season, episode) {
   }
   console.log(`[Resolve] "${info.title}" (${info.year})`);
 
-  let results = await searchFasel(info.title, info.year);
-  if (results.length === 0 && info.year) {
-    results = await searchFasel(`${info.title} ${info.year}`, info.year);
+  // Build search queries — FaselHD struggles with special chars like apostrophes/colons
+  const queries = [info.title];
+  // Strip special characters
+  const cleaned = info.title.replace(/[''`:;,!?]/g, "").replace(/\s+/g, " ").trim();
+  if (cleaned !== info.title) queries.push(cleaned);
+  // If title has a colon/dash subtitle, try both parts
+  const parts = info.title.split(/[:\-–—]\s*/);
+  if (parts.length > 1) {
+    queries.push(parts[parts.length - 1].trim()); // subtitle
+    queries.push(parts[0].trim()); // main title
+  }
+
+  let results = [];
+  for (const q of queries) {
+    results = await searchFasel(q, info.year);
+    if (results.length > 0) break;
+    if (info.year) {
+      results = await searchFasel(`${q} ${info.year}`, info.year);
+      if (results.length > 0) break;
+    }
   }
   if (results.length === 0) {
     console.log("[Resolve] Nothing found on FaselHD");
@@ -517,31 +567,49 @@ async function resolve(imdbId, type, season, episode) {
   const streams = [];
   let targetUrl = results[0].url;
 
-  // Series: navigate to the specific episode page first
+  // Series: navigate to correct season → episode
   if (type === "series" && season && episode) {
     const sn = parseInt(season);
     const ep = parseInt(episode);
-    const episodes = await getEpisodes(targetUrl);
 
-    const pat = new RegExp(
-      `(s0?${sn}e0?${ep}|season[\\s-]*${sn}.*episode[\\s-]*${ep}|الحلقة[\\s-]*${ep}|ep\\.?[\\s-]*${ep})`,
-      "i"
-    );
+    // Parse the first result's page for season/episode info
+    let { seasons, episodes } = await parseSeriesPage(targetUrl);
 
-    let epUrl = null;
-    for (const e of episodes) {
-      if (pat.test(e.title) || pat.test(e.url)) {
-        epUrl = e.url;
-        break;
+    // If seasons exist and we need a different one, navigate there
+    if (seasons.length > 0) {
+      const match = seasons.find((s) => s.num === sn);
+      if (match) {
+        console.log(`[Resolve] Season ${sn}: ${match.url}`);
+        // If not already on the right season, fetch that page
+        const isActive = seasons.findIndex((s) => s.num === sn);
+        // Re-parse the correct season page for its episodes
+        const seasonPage = await parseSeriesPage(match.url);
+        episodes = seasonPage.episodes;
+      } else {
+        console.log(
+          `[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`
+        );
       }
     }
-    if (!epUrl && episodes.length >= ep) {
+
+    // Find the specific episode
+    let epUrl = null;
+    // Match by episode number
+    const epMatch = episodes.find((e) => e.num === ep);
+    if (epMatch) {
+      epUrl = epMatch.url;
+    } else if (episodes.length >= ep) {
+      // Fallback: use index
       epUrl = episodes[ep - 1]?.url;
     }
 
     if (epUrl) {
-      console.log(`[Resolve] Episode: ${epUrl}`);
+      console.log(`[Resolve] Episode ${ep}: ${epUrl}`);
       targetUrl = epUrl;
+    } else {
+      console.log(
+        `[Resolve] Episode ${ep} not found (${episodes.length} episodes available)`
+      );
     }
   }
 

@@ -1,3 +1,8 @@
+# fly.toml app configuration file generated for faselhdx on 2026-03-17T04:09:00+03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'faselhdx'
 primary_region = 'fra'
 
@@ -13,7 +18,13 @@ primary_region = 'fra'
 [checks]
   [checks.health]
     port = 8080
-    type = "http"
-    interval = "30s"
-    timeout = "5s"
-    path = "/manifest.json"
+    type = 'http'
+    interval = '30s'
+    timeout = '5s'
+    path = '/manifest.json'
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
