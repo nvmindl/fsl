@@ -308,56 +308,137 @@ async function getImdbInfo(imdbId) {
   return null;
 }
 
+// ── Search helpers (bypass CF-blocked /?s= endpoint) ──
+
+function convertToActiveDomain(rawUrl, activeDomainUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const active = new URL(activeDomainUrl);
+    parsed.hostname = active.hostname;
+    parsed.protocol = active.protocol;
+    parsed.port = active.port;
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return rawUrl;
+  }
+}
+
+async function searchViaRSS(query, domain) {
+  try {
+    const url = `${domain}/feed/?s=${encodeURIComponent(query)}`;
+    console.log(`[RSS] ${url}`);
+    // Try native fetch first (faster), fall back to browserFetch if CF blocks it
+    let xml;
+    try {
+      const resp = await fetch(url, {
+        headers: { ...HEADERS, Accept: "application/rss+xml,application/xml,text/xml" },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (resp.ok) {
+        xml = await resp.text();
+        if (xml.includes("Just a moment") || xml.includes("Checking your browser")) {
+          console.log("[RSS] CF challenge on native fetch, trying browser...");
+          xml = null;
+        }
+      }
+    } catch {}
+    if (!xml) xml = await browserFetch(url, 15000);
+    if (!xml || xml.includes("Just a moment")) return [];
+
+    const $ = cheerio.load(xml, { xmlMode: true });
+    const results = [];
+    $("item").each((_, el) => {
+      const title = $(el).find("title").text().trim();
+      const link = $(el).find("link").text().trim();
+      if (link) results.push({ url: link, title });
+    });
+    console.log(`[RSS] Found ${results.length} result(s)`);
+    return results;
+  } catch (err) {
+    console.error(`[RSS] ${err.message}`);
+    return [];
+  }
+}
+
+async function searchViaDuckDuckGo(query, year, domain) {
+  try {
+    const sq = `site:fasel-hd.cam ${query}${year ? " " + year : ""}`;
+    console.log(`[DDG] Searching: ${sq}`);
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(sq)}`;
+    const resp = await fetch(url, {
+      headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) return [];
+    const html = await resp.text();
+
+    // Extract FaselHD URLs from DDG results (raw HTML + decoded uddg redirect params)
+    const faselRegex = /https?:\/\/(?:www\.)?(?:fasel-hd\.cam|faselhd\.club|web\d+x\.faselhdx\.best)\/(?:movies|series|seasons|anime|episodes)\/[^\s"'&<)]+/gi;
+    const decoded = [...html.matchAll(/uddg=([^&"]+)/g)]
+      .map((m) => decodeURIComponent(m[1]))
+      .join("\n");
+    const searchIn = html + "\n" + decoded;
+
+    const found = new Set();
+    let m;
+    while ((m = faselRegex.exec(searchIn)) !== null) {
+      found.add(m[0].replace(/&amp;/g, "&"));
+    }
+
+    const results = [...found].map((rawUrl) => ({
+      url: convertToActiveDomain(rawUrl, domain),
+      title: "",
+    }));
+    console.log(`[DDG] Found ${results.length} result(s)`);
+    return results;
+  } catch (err) {
+    console.error(`[DDG] ${err.message}`);
+    return [];
+  }
+}
+
 // ── FaselHD Search ──
 
 async function searchFasel(query, year, type) {
   const domain = await getDomain();
-  const url = `${domain}/?s=${encodeURIComponent(query)}`;
-  const html = await fetchPage(url);
-  if (!html) return [];
+  const cacheKey = `${query}|${year}`;
+  const cached = cacheGet(cache.search, cacheKey, SEARCH_TTL);
+  if (cached) return cached;
 
-  const $ = cheerio.load(html);
-  const results = [];
-  const seen = new Set();
+  let results = [];
 
-  // FaselHD uses .postDiv cards for search results
-  $(".postDiv").each((_, el) => {
-    const a = $(el).find("a").first();
-    const href = a.attr("href") || "";
-    const title = $(el).find(".h1").text().trim() || a.text().trim();
-    if (href && !seen.has(href)) {
-      seen.add(href);
-      const full = href.startsWith("http") ? href : `${domain}${href}`;
-      results.push({ url: full, title: title || "unknown" });
-    }
-  });
+  // Strategy 1: RSS feed (same domain, bypasses CF on search page)
+  results = await searchViaRSS(query, domain);
 
-  // Sort by relevance: type match first, then year match
-  // FaselHD prefixes: مسلسل = series, فيلم = movie, انمي = anime
-  const seriesWords = /مسلسل|anime|انمي/i;
-  const movieWords = /فيلم|movie/i;
-  results.sort((a, b) => {
-    // Type match priority
-    if (type === "series") {
-      const aMatch = seriesWords.test(a.title) || seriesWords.test(a.url) ? 0 : 1;
-      const bMatch = seriesWords.test(b.title) || seriesWords.test(b.url) ? 0 : 1;
-      if (aMatch !== bMatch) return aMatch - bMatch;
-    } else if (type === "movie") {
-      const aMatch = movieWords.test(a.title) || movieWords.test(a.url) ? 0 : 1;
-      const bMatch = movieWords.test(b.title) || movieWords.test(b.url) ? 0 : 1;
-      if (aMatch !== bMatch) return aMatch - bMatch;
-    }
-    // Year match secondary
-    if (year) {
-      const aHas = a.title.includes(String(year)) || a.url.includes(String(year)) ? 0 : 1;
-      const bHas = b.title.includes(String(year)) || b.url.includes(String(year)) ? 0 : 1;
+  // Strategy 2: DuckDuckGo fallback
+  if (!results.length) results = await searchViaDuckDuckGo(query, year, domain);
+
+  // Filter by content type
+  if (type === "movie") {
+    const filtered = results.filter((r) => r.url.includes("/movies/"));
+    if (filtered.length) results = filtered;
+  } else if (type === "series") {
+    // Prefer /seasons/ (main series page), then /series/, then anything
+    const seasons = results.filter((r) => r.url.includes("/seasons/"));
+    const series = results.filter(
+      (r) => r.url.includes("/series/") || r.url.includes("/anime/")
+    );
+    if (seasons.length) results = seasons;
+    else if (series.length) results = series;
+  }
+
+  // Sort: prefer results with year in URL/title
+  if (year) {
+    results.sort((a, b) => {
+      const aHas = (a.url.includes(String(year)) || a.title.includes(String(year))) ? 0 : 1;
+      const bHas = (b.url.includes(String(year)) || b.title.includes(String(year))) ? 0 : 1;
       return aHas - bHas;
-    }
-    return 0;
-  });
+    });
+  }
 
-  console.log(`[Search] "${query}" → ${results.length} results`);
-  results.forEach((r, i) => console.log(`  ${i}: ${r.title}`));
+  console.log(`[Search] "${query}" → ${results.length} result(s)`);
+  results.forEach((r, i) => console.log(`  ${i}: ${r.title} → ${r.url}`));
+  if (results.length > 0) cacheSet(cache.search, cacheKey, results);
   return results;
 }
 
@@ -976,6 +1057,44 @@ const server = http.createServer(async (req, res) => {
       };
       await page6.close();
     } catch (e) { results.test6_googleSearch = { error: e.message }; }
+
+    // Test 7: RSS feed search (native fetch)
+    try {
+      const rssUrl = `${activeDomain}/feed/?s=Inception`;
+      const rssResp = await fetch(rssUrl, {
+        headers: { ...HEADERS, Accept: "application/rss+xml,application/xml" },
+        signal: AbortSignal.timeout(10000),
+      });
+      const rssText = await rssResp.text();
+      const isCf = rssText.includes("Just a moment");
+      const itemCount = (rssText.match(/<item>/g) || []).length;
+      const links = [...rssText.matchAll(/<link>([^<]+)<\/link>/g)].map(m => m[1]).filter(l => l.includes("/movies/") || l.includes("/seasons/") || l.includes("/series/"));
+      results.test7_rssFeed_nativeFetch = {
+        status: rssResp.status,
+        length: rssText.length,
+        cf: isCf,
+        items: itemCount,
+        contentLinks: links.slice(0, 5),
+      };
+    } catch (e) { results.test7_rssFeed_nativeFetch = { error: e.message }; }
+
+    // Test 8: RSS feed search (via browser)
+    try {
+      const rssUrl2 = `${activeDomain}/feed/?s=Inception`;
+      const page8 = await browser.newPage();
+      await page8.setUserAgent(UA);
+      await page8.goto(rssUrl2, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await new Promise(r => setTimeout(r, 1000));
+      const rssHtml = await page8.content();
+      const isCf8 = rssHtml.includes("Just a moment");
+      const links8 = [...rssHtml.matchAll(/https?:\/\/[^<"]+\/(?:movies|seasons|series)\/[^<"]+/g)].map(m => m[0]);
+      results.test8_rssFeed_browser = {
+        length: rssHtml.length,
+        cf: isCf8,
+        contentLinks: links8.slice(0, 5),
+      };
+      await page8.close();
+    } catch (e) { results.test8_rssFeed_browser = { error: e.message }; }
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(results, null, 2));
