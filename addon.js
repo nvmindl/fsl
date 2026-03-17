@@ -330,77 +330,8 @@ async function getImdbInfo(imdbId) {
 
 // ── Sitemap-based search (bypasses CF-blocked /?s= endpoint) ──
 
-// Sitemap URL index — cached in memory
-const sitemapCache = {
-  movies: [],    // array of URL strings from movies-sitemap{1-14}.xml
-  seasons: [],   // array of URL strings from seasons-sitemap{1-4}.xml
-  series: [],    // array of URL strings from series-sitemap{1-8}.xml
-  ts: 0,
-};
-const SITEMAP_TTL = 6 * 60 * 60 * 1000; // 6 hours
-let sitemapLoadPromise = null;
-
-async function fetchSitemapUrls(baseUrl, prefix, maxNum) {
-  const urls = [];
-  // Download sitemaps in small batches to avoid rate limiting
-  for (let start = 1; start <= maxNum; start += 3) {
-    const batch = [];
-    for (let i = start; i < start + 3 && i <= maxNum; i++) {
-      batch.push(
-        fetch(`${baseUrl}/${prefix}-sitemap${i}.xml`, {
-          headers: { "User-Agent": UA },
-          signal: AbortSignal.timeout(15000),
-        })
-          .then(async (r) => {
-            if (!r.ok) return [];
-            const xml = await r.text();
-            if (xml.includes("Just a moment")) return [];
-            return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
-          })
-          .catch((e) => { console.log(`[Sitemap] ${prefix}-sitemap${start}: ${e.message}`); return []; })
-      );
-    }
-    const results = await Promise.all(batch);
-    for (const r of results) urls.push(...r);
-  }
-  return urls;
-}
-
-async function loadSitemaps() {
-  const domain = await getDomain();
-  console.log("[Sitemap] Loading sitemaps sequentially...");
-  const startTime = Date.now();
-
-  try {
-    const movies = await fetchSitemapUrls(domain, "movies", 14);
-    console.log(`[Sitemap] Movies: ${movies.length} URLs`);
-    const seasons = await fetchSitemapUrls(domain, "seasons", 4);
-    console.log(`[Sitemap] Seasons: ${seasons.length} URLs`);
-    const series = await fetchSitemapUrls(domain, "series", 8);
-    console.log(`[Sitemap] Series: ${series.length} URLs`);
-
-    sitemapCache.movies = movies;
-    sitemapCache.seasons = seasons;
-    sitemapCache.series = series;
-    sitemapCache.ts = Date.now();
-
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[Sitemap] Done: ${movies.length} movies, ${seasons.length} seasons, ${series.length} series in ${elapsed}s`);
-  } catch (err) {
-    console.error(`[Sitemap] Loading failed: ${err.message}`);
-  }
-}
-
-async function getSitemaps() {
-  if (Date.now() - sitemapCache.ts < SITEMAP_TTL && sitemapCache.movies.length > 0) {
-    return sitemapCache;
-  }
-  if (!sitemapLoadPromise) {
-    sitemapLoadPromise = loadSitemaps().finally(() => { sitemapLoadPromise = null; });
-  }
-  await sitemapLoadPromise;
-  return sitemapCache;
-}
+// ── Sitemap-based search (on-demand, low memory) ──
+// Instead of loading all sitemaps into memory, we search them one at a time
 
 function slugify(title) {
   return title
@@ -413,36 +344,58 @@ function slugify(title) {
     .trim();
 }
 
-function searchSitemapUrls(urls, slug, year) {
-  const decoded = urls.map((u) => decodeURIComponent(u).toLowerCase());
+// Search a single sitemap XML for matching URLs
+function searchInXml(xml, slug, year) {
+  const urls = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1]);
   const results = [];
-  for (let i = 0; i < decoded.length; i++) {
-    if (decoded[i].includes(slug)) {
-      results.push({ url: urls[i], title: "", score: 0 });
-      // Score by year match
-      if (year && decoded[i].includes(String(year))) {
-        results[results.length - 1].score += 10;
-      }
+  for (const url of urls) {
+    const decoded = decodeURIComponent(url).toLowerCase();
+    if (decoded.includes(slug)) {
+      let score = 0;
+      if (year && decoded.includes(String(year))) score += 10;
+      results.push({ url, title: "", score });
     }
   }
-  // Also try individual words for multi-word titles (e.g., "game-of-thrones" → try "thrones")
+  // Fallback: try individual words
   if (results.length === 0) {
-    const words = slug.split("-").filter((w) => w.length >= 4);
+    const words = slug.split("-").filter(w => w.length >= 4);
     if (words.length > 1) {
-      // Try matching all significant words
-      for (let i = 0; i < decoded.length; i++) {
-        const matchCount = words.filter((w) => decoded[i].includes(w)).length;
+      for (const url of urls) {
+        const decoded = decodeURIComponent(url).toLowerCase();
+        const matchCount = words.filter(w => decoded.includes(w)).length;
         if (matchCount >= Math.ceil(words.length * 0.6)) {
-          results.push({ url: urls[i], title: "", score: matchCount });
-          if (year && decoded[i].includes(String(year))) {
-            results[results.length - 1].score += 10;
-          }
+          let score = matchCount;
+          if (year && decoded.includes(String(year))) score += 10;
+          results.push({ url, title: "", score });
         }
       }
     }
   }
-  results.sort((a, b) => b.score - a.score);
   return results;
+}
+
+// Search across sitemaps of a given type, stopping early when found
+async function searchSitemaps(domain, prefix, maxNum, slug, year) {
+  const allResults = [];
+  for (let i = 1; i <= maxNum; i++) {
+    try {
+      const resp = await fetch(`${domain}/${prefix}-sitemap${i}.xml`, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!resp.ok) continue;
+      const xml = await resp.text();
+      if (xml.includes("Just a moment")) continue;
+      const found = searchInXml(xml, slug, year);
+      allResults.push(...found);
+      // If we found good matches (with year), stop early
+      if (allResults.some(r => r.score >= 10)) break;
+    } catch (e) {
+      console.log(`[Sitemap] ${prefix}-sitemap${i}: ${e.message}`);
+    }
+  }
+  allResults.sort((a, b) => b.score - a.score);
+  return allResults;
 }
 
 async function searchViaRSS(query, domain) {
@@ -492,21 +445,16 @@ async function searchFasel(query, year, type) {
 
   let results = [];
 
-  // Strategy 1: Sitemap search (works from datacenter, no CF)
-  const sm = await getSitemaps();
+  // Strategy 1: On-demand sitemap search (works from datacenter, no CF)
   if (type === "movie") {
-    results = searchSitemapUrls(sm.movies, slug, year);
+    results = await searchSitemaps(domain, "movies", 14, slug, year);
   } else if (type === "series") {
-    // Search seasons first (main series listing pages), then series (individual seasons)
-    results = searchSitemapUrls(sm.seasons, slug, year);
-    if (!results.length) results = searchSitemapUrls(sm.series, slug, year);
+    results = await searchSitemaps(domain, "seasons", 4, slug, year);
+    if (!results.length) results = await searchSitemaps(domain, "series", 8, slug, year);
   } else {
-    // Search all
-    results = [
-      ...searchSitemapUrls(sm.movies, slug, year),
-      ...searchSitemapUrls(sm.seasons, slug, year),
-      ...searchSitemapUrls(sm.series, slug, year),
-    ];
+    results = await searchSitemaps(domain, "movies", 14, slug, year);
+    if (!results.length) results = await searchSitemaps(domain, "seasons", 4, slug, year);
+    if (!results.length) results = await searchSitemaps(domain, "series", 8, slug, year);
   }
 
   // Strategy 2: RSS feed fallback (works from residential IPs)
@@ -1097,46 +1045,11 @@ const server = http.createServer(async (req, res) => {
       chromiumExists,
       nodeVersion: process.version,
       memoryMB: Math.round(process.memoryUsage().rss / 1048576),
-      sitemapUrls: {
-        movies: sitemapCache.movies.length,
-        seasons: sitemapCache.seasons.length,
-        series: sitemapCache.series.length,
-        age: sitemapCache.ts ? Date.now() - sitemapCache.ts : null,
-      },
+      searchCache: cache.search.size,
+      streamCache: cache.stream.size,
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(info, null, 2));
-    return;
-  }
-
-  // Quick sitemap test (no browser, fast)
-  if (req.url === "/test-sitemap") {
-    const results = {};
-    try {
-      const smUrl = `${activeDomain}/movies-sitemap3.xml`;
-      const r = await fetch(smUrl, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15000) });
-      const xml = await r.text();
-      const cf = xml.includes("Just a moment");
-      const urls = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1]);
-      const inception = urls.filter(u => u.toLowerCase().includes("inception"));
-      results.sitemapFetch = { status: r.status, length: xml.length, cf, urlCount: urls.length, inception: inception[0] || null };
-    } catch (e) { results.sitemapFetch = { error: e.message }; }
-
-    try {
-      const sm = await getSitemaps();
-      const movieResults = searchSitemapUrls(sm.movies, "inception", 2010);
-      const seriesResults = searchSitemapUrls(sm.seasons, "breaking-bad", null);
-      results.search = {
-        totalMovies: sm.movies.length,
-        totalSeasons: sm.seasons.length,
-        totalSeries: sm.series.length,
-        inceptionFound: movieResults.slice(0, 2).map(r => r.url),
-        breakingBadFound: seriesResults.slice(0, 2).map(r => r.url),
-      };
-    } catch (e) { results.search = { error: e.message }; }
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(results, null, 2));
     return;
   }
 
@@ -1156,9 +1069,6 @@ server.listen(PORT, () => {
   console.log(`  Health:   http://localhost:${PORT}/health`);
   console.log(`  Test:     http://localhost:${PORT}/stream/movie/tt6166392.json`);
   console.log("=".repeat(55));
-
-  // Preload sitemaps in background on startup
-  getSitemaps().then(() => console.log("[Startup] Sitemaps preloaded")).catch(() => {});
 });
 
 process.on("SIGINT", () => {
