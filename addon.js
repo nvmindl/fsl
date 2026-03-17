@@ -144,7 +144,7 @@ function cacheSet(store, key, data) {
 }
 
 // ── FaselHD Domain Rotation ──
-const DOMAIN_BASE = "faselhdx.best";
+const DOMAIN_BASE = "faselhdx";
 const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
 let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31712x.faselhdx.best";
 let domainLastCheck = Date.now(); // Trust configured domain on startup
@@ -170,7 +170,7 @@ async function discoverDomain() {
         signal: AbortSignal.timeout(6000),
       });
       const loc = resp.headers.get("location") || "";
-      const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.best/);
+      const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
       if (m) {
         const candidate = m[0].replace(/^http:/, "https:");
         if (await testDomain(candidate)) {
@@ -197,7 +197,7 @@ async function discoverDomain() {
     }
     const results = await Promise.all(
       batch.map(async (num) => {
-        const domain = `https://web${num}x.${DOMAIN_BASE}`;
+        const domain = `https://web${num}x.${DOMAIN_BASE}.best`;
         return (await testDomain(domain)) ? domain : null;
       })
     );
@@ -406,7 +406,12 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   // If no exact year match but we have results, that's fine
   if (allResults.length === 0 && !found) return [];
   allResults.sort((a, b) => b.score - a.score);
-  return allResults;
+  // Normalize URLs to use the active domain
+  const currentDomain = await getDomain();
+  return allResults.map(r => ({
+    ...r,
+    url: r.url.replace(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/, currentDomain)
+  }));
 }
 
 async function searchViaRSS(query, domain) {
