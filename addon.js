@@ -1072,6 +1072,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Debug search endpoint
+  if (req.url.startsWith("/debug/search?")) {
+    const p = new URL(req.url, `http://localhost:${PORT}`);
+    const q = p.searchParams.get("q") || "";
+    const type = p.searchParams.get("type") || "movie";
+    const year = parseInt(p.searchParams.get("year")) || 0;
+    try {
+      const domain = await getDomain();
+      const slug = slugify(q);
+      const sitemapResults = await searchSitemaps(domain, type === "movie" ? "movies" : "seasons", type === "movie" ? 14 : 4, slug, year);
+      const rssResults = await searchViaRSS(q, domain);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ domain, slug, sitemapResults, rssResults }, null, 2));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // Stremio SDK router
   router(req, res, () => {
     res.writeHead(404);
