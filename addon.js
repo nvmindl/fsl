@@ -59,21 +59,11 @@ async function browserFetch(url, timeout = 45000) {
   try {
     await page.setUserAgent(UA);
     await page.setViewport({ width: 1920, height: 1080 });
-    await page.setRequestInterception(true);
-
-    // Block images, fonts, media to speed up loading
-    page.on("request", (req) => {
-      const type = req.resourceType();
-      if (["image", "font", "media", "stylesheet"].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
+    // NOTE: Do NOT use request interception — aborting CSS/images triggers CF detection
 
     console.log(`[Browser] Navigating: ${url}`);
     const response = await page.goto(url, {
-      waitUntil: "domcontentloaded",
+      waitUntil: "networkidle2",
       timeout,
     });
 
