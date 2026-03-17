@@ -862,6 +862,91 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Diagnostic: test different browser configs to find what bypasses CF
+  if (req.url === "/diag") {
+    const results = {};
+    const browser = await getBrowser();
+
+    // Test 1: Root page, NO request interception (like the old version that worked)
+    try {
+      const page1 = await browser.newPage();
+      await page1.setUserAgent(UA);
+      await page1.setViewport({ width: 1920, height: 1080 });
+      await page1.goto(`${activeDomain}/`, { waitUntil: "networkidle2", timeout: 30000 });
+      const html1 = await page1.content();
+      results.test1_root_noIntercept = {
+        length: html1.length,
+        cf: html1.includes("Just a moment"),
+        hasPostDiv: html1.includes("postDiv"),
+        title: (html1.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      };
+      await page1.close();
+    } catch (e) { results.test1_root_noIntercept = { error: e.message }; }
+
+    // Test 2: Search page, NO request interception
+    try {
+      const page2 = await browser.newPage();
+      await page2.setUserAgent(UA);
+      await page2.setViewport({ width: 1920, height: 1080 });
+      await page2.goto(`${activeDomain}/?s=Inception`, { waitUntil: "networkidle2", timeout: 30000 });
+      const html2 = await page2.content();
+      results.test2_search_noIntercept = {
+        length: html2.length,
+        cf: html2.includes("Just a moment"),
+        hasPostDiv: html2.includes("postDiv"),
+        title: (html2.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      };
+      await page2.close();
+    } catch (e) { results.test2_search_noIntercept = { error: e.message }; }
+
+    // Test 3: Search page, WITH request interception (blocking images/fonts/css)
+    try {
+      const page3 = await browser.newPage();
+      await page3.setUserAgent(UA);
+      await page3.setViewport({ width: 1920, height: 1080 });
+      await page3.setRequestInterception(true);
+      page3.on("request", (r) => {
+        const t = r.resourceType();
+        if (["image", "font", "media", "stylesheet"].includes(t)) r.abort();
+        else r.continue();
+      });
+      await page3.goto(`${activeDomain}/?s=Inception`, { waitUntil: "networkidle2", timeout: 30000 });
+      const html3 = await page3.content();
+      results.test3_search_withIntercept = {
+        length: html3.length,
+        cf: html3.includes("Just a moment"),
+        hasPostDiv: html3.includes("postDiv"),
+        title: (html3.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      };
+      await page3.close();
+    } catch (e) { results.test3_search_withIntercept = { error: e.message }; }
+
+    // Test 4: Root page first (warm cookies), then search page in same context
+    try {
+      const page4 = await browser.newPage();
+      await page4.setUserAgent(UA);
+      await page4.setViewport({ width: 1920, height: 1080 });
+      await page4.goto(`${activeDomain}/`, { waitUntil: "networkidle2", timeout: 30000 });
+      const rootHtml = await page4.content();
+      const rootCf = rootHtml.includes("Just a moment");
+      // Now navigate to search
+      await page4.goto(`${activeDomain}/?s=Inception`, { waitUntil: "networkidle2", timeout: 30000 });
+      const html4 = await page4.content();
+      results.test4_root_then_search = {
+        rootCf,
+        length: html4.length,
+        cf: html4.includes("Just a moment"),
+        hasPostDiv: html4.includes("postDiv"),
+        title: (html4.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      };
+      await page4.close();
+    } catch (e) { results.test4_root_then_search = { error: e.message }; }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(results, null, 2));
+    return;
+  }
+
   // Stremio SDK router
   router(req, res, () => {
     res.writeHead(404);
