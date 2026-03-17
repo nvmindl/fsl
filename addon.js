@@ -116,7 +116,7 @@ const cache = {
   stream: new Map(),  // imdbId:s:e → { streams, ts }
 };
 const IMDB_TTL = 24 * 60 * 60 * 1000;   // 24h
-const SEARCH_TTL = 15 * 60 * 1000;       // 15min
+const SEARCH_TTL = 60 * 60 * 1000;        // 1h (sitemap-based, stable results)
 const STREAM_TTL = 60 * 60 * 1000;       // 1h
 
 function cacheGet(store, key, ttl) {
@@ -137,7 +137,7 @@ function cacheSet(store, key, data) {
 const DOMAIN_BASE = "faselhdx.best";
 const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
 let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31712x.faselhdx.best";
-let domainLastCheck = 0;
+let domainLastCheck = Date.now(); // Trust configured domain on startup
 const DOMAIN_TTL = 30 * 60 * 1000;
 let domainDiscoveryPromise = null;
 
@@ -284,14 +284,12 @@ async function fetchPage(url, retries = 2) {
 
       if (html.includes("Just a moment") || html.includes("Checking your browser")) {
         console.log("[Fetch] Cloudflare challenge page returned");
-        if (url.includes(DOMAIN_BASE)) markDomainBad();
         continue;
       }
 
       return html;
     } catch (err) {
       console.error(`[Fetch] ${err.message}`);
-      if (url.includes(DOMAIN_BASE)) markDomainBad();
     }
   }
   return null;
