@@ -28,10 +28,11 @@ function cacheSet(store, key, data) {
 
 // ── FaselHD Domain Rotation ──
 const DOMAIN_BASE = "faselhdx.best";
-let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31618x.faselhdx.best";
+const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
+let activeDomain = process.env.FASELHDX_DOMAIN || "https://web3170x.faselhdx.best";
 let domainLastCheck = 0;
 const DOMAIN_TTL = 30 * 60 * 1000;
-let domainDiscoveryPromise = null; // dedup concurrent discoveries
+let domainDiscoveryPromise = null;
 
 async function discoverDomain() {
   // Try last known domain first
@@ -40,11 +41,42 @@ async function discoverDomain() {
     return activeDomain;
   }
 
-  console.log("[Domain] Active domain down, scanning...");
-  const numMatch = activeDomain.match(/web(\d+)x/);
-  const lastNum = numMatch ? parseInt(numMatch[1]) : 31618;
+  console.log("[Domain] Active domain down, discovering via redirect...");
 
-  // Scan in parallel batches of 10 for speed
+  // PRIMARY METHOD: Follow fasel-hd.cam redirect to find active webXx subdomain
+  // fasel-hd.cam/wp-admin/admin-ajax.php redirects to the active subdomain
+  for (const fallback of FALLBACK_DOMAINS) {
+    try {
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${fallback}/wp-admin/admin-ajax.php`, {
+        method: "HEAD",
+        headers: { "User-Agent": UA },
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      clearTimeout(tid);
+      const loc = res.headers.get("location") || "";
+      const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.best/);
+      if (m) {
+        const candidate = m[0].replace(/^http:/, "https:");
+        if (await testDomain(candidate)) {
+          activeDomain = candidate;
+          domainLastCheck = Date.now();
+          console.log(`[Domain] Discovered via redirect: ${activeDomain}`);
+          return activeDomain;
+        }
+      }
+    } catch (e) {
+      console.log(`[Domain] Redirect probe failed for ${fallback}: ${e.message}`);
+    }
+  }
+
+  // FALLBACK: Scan nearby numbers from last known
+  console.log("[Domain] Redirect method failed, scanning...");
+  const numMatch = activeDomain.match(/web(\d+)x/);
+  const lastNum = numMatch ? parseInt(numMatch[1]) : 3170;
+
   for (let base = -5; base <= 50; base += 10) {
     const batch = [];
     for (let i = 0; i < 10 && base + i <= 50; i++) {
@@ -60,7 +92,7 @@ async function discoverDomain() {
     if (found) {
       activeDomain = found;
       domainLastCheck = Date.now();
-      console.log(`[Domain] Discovered: ${activeDomain}`);
+      console.log(`[Domain] Discovered via scan: ${activeDomain}`);
       return activeDomain;
     }
   }
