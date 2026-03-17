@@ -6,3 +6,5 @@ services:
     envVars:
       - key: PORT
         value: "8080"
+      - key: PUBLIC_URL
+        value: "https://faselhdx.onrender.com"

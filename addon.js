@@ -951,14 +951,20 @@ builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`\n[Stream] ${type} ${id}`);
     const raw = await resolve(imdbId, type, season, episode);
 
+    // Build proxy base URL from environment or request context
+    const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+
     const seen = new Set();
     const streams = raw
-      .map((s) => ({
-        name: "FaselHD",
-        title: s.title || "FaselHD",
-        url: s.url,
-        behaviorHints: { notWebReady: false },
-      }))
+      .map((s) => {
+        const proxiedUrl = `${proxyBase}/proxy?url=${Buffer.from(s.url).toString('base64url')}`;
+        return {
+          name: "FaselHD",
+          title: s.title || "FaselHD",
+          url: proxiedUrl,
+          behaviorHints: { notWebReady: false },
+        };
+      })
       .filter((s) => {
         if (seen.has(s.url)) return false;
         seen.add(s.url);
@@ -993,6 +999,94 @@ const server = http.createServer(async (req, res) => {
     }
   }, 120000);
   res.on("finish", () => clearTimeout(requestTimeout));
+  // ── M3U8/segment proxy (bypasses IP-locked streams) ──
+  if (req.url.startsWith("/proxy")) {
+    const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+    const b64 = parsedUrl.searchParams.get("url");
+    if (!b64) {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("Missing url parameter");
+      return;
+    }
+    let targetUrl;
+    try {
+      targetUrl = Buffer.from(b64, 'base64url').toString();
+    } catch {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("Invalid url parameter");
+      return;
+    }
+
+    // Only allow proxying to known CDN domains
+    const allowed = ['scdns.io', 'faselhdx.best', 'faselhdx.xyz'];
+    let hostname;
+    try { hostname = new URL(targetUrl).hostname; } catch { hostname = ''; }
+    if (!allowed.some(d => hostname.endsWith(d))) {
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("Domain not allowed");
+      return;
+    }
+
+    try {
+      const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+      const upstream = await fetch(targetUrl, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (!upstream.ok) {
+        res.writeHead(upstream.status, { "Content-Type": "text/plain" });
+        res.end(`Upstream error: ${upstream.status}`);
+        return;
+      }
+
+      const ct = upstream.headers.get("content-type") || "";
+
+      // If it's an m3u8, rewrite URLs inside to go through proxy
+      if (ct.includes("mpegurl") || targetUrl.endsWith(".m3u8")) {
+        let body = await upstream.text();
+        // Rewrite absolute URLs
+        body = body.replace(/^(https?:\/\/[^\s]+)/gm, (url) => {
+          return `${proxyBase}/proxy?url=${Buffer.from(url.trim()).toString('base64url')}`;
+        });
+        res.writeHead(200, {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end(body);
+        return;
+      }
+
+      // For .ts segments or other binary data, pipe through
+      const headers = {
+        "Content-Type": ct || "application/octet-stream",
+        "Access-Control-Allow-Origin": "*",
+      };
+      const cl = upstream.headers.get("content-length");
+      if (cl) headers["Content-Length"] = cl;
+      res.writeHead(200, headers);
+
+      // Stream the body
+      const reader = upstream.body.getReader();
+      const pump = async () => {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        res.end();
+      };
+      await pump();
+    } catch (err) {
+      console.error(`[Proxy] Error: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end(`Proxy error: ${err.message}`);
+      }
+    }
+    return;
+  }
+
   // Health/debug endpoint
   if (req.url === "/health") {
     const fs = require("fs");
