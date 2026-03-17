@@ -913,7 +913,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const seen = new Set();
     const streams = raw
       .map((s) => {
-        const proxiedUrl = `${proxyBase}/proxy?url=${Buffer.from(s.url).toString('base64url')}`;
+        const proxiedUrl = `${proxyBase}/proxy/${Buffer.from(s.url).toString('base64url')}/stream.m3u8`;
         return {
           name: "FaselHD",
           title: s.title || "FaselHD",
@@ -956,9 +956,10 @@ const server = http.createServer(async (req, res) => {
   }, 120000);
   res.on("finish", () => clearTimeout(requestTimeout));
   // ── M3U8/segment proxy (bypasses IP-locked streams) ──
-  if (req.url.startsWith("/proxy")) {
-    const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
-    const b64 = parsedUrl.searchParams.get("url");
+  if (req.url.startsWith("/proxy/")) {
+    // URL format: /proxy/{base64url}/{filename}
+    const pathParts = req.url.split('/');
+    const b64 = pathParts[2]; // the base64url-encoded target URL
     if (!b64) {
       res.writeHead(400, { "Content-Type": "text/plain" });
       res.end("Missing url parameter");
@@ -1003,7 +1004,9 @@ const server = http.createServer(async (req, res) => {
         let body = await upstream.text();
         // Rewrite absolute URLs
         body = body.replace(/^(https?:\/\/[^\s]+)/gm, (url) => {
-          return `${proxyBase}/proxy?url=${Buffer.from(url.trim()).toString('base64url')}`;
+          const trimmed = url.trim();
+          const ext = trimmed.endsWith('.m3u8') ? 'stream.m3u8' : 'segment.ts';
+          return `${proxyBase}/proxy/${Buffer.from(trimmed).toString('base64url')}/${ext}`;
         });
         res.writeHead(200, {
           "Content-Type": "application/vnd.apple.mpegurl",
