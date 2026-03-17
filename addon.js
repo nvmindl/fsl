@@ -342,15 +342,14 @@ let sitemapLoadPromise = null;
 
 async function fetchSitemapUrls(baseUrl, prefix, maxNum) {
   const urls = [];
-  // Download sitemaps in parallel batches of 5
-  for (let start = 1; start <= maxNum; start += 5) {
-    const batch = [];
-    for (let i = start; i < start + 5 && i <= maxNum; i++) {
-      batch.push(
-        fetch(`${baseUrl}/${prefix}-sitemap${i}.xml`, {
-          headers: { "User-Agent": UA },
-          signal: AbortSignal.timeout(15000),
-        })
+  // Download ALL sitemaps in parallel (they're small XML files)
+  const batch = [];
+  for (let i = 1; i <= maxNum; i++) {
+    batch.push(
+      fetch(`${baseUrl}/${prefix}-sitemap${i}.xml`, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(10000),
+      })
           .then(async (r) => {
             if (!r.ok) return [];
             const xml = await r.text();
@@ -358,32 +357,41 @@ async function fetchSitemapUrls(baseUrl, prefix, maxNum) {
             return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
           })
           .catch(() => [])
-      );
-    }
-    const results = await Promise.all(batch);
-    for (const r of results) urls.push(...r);
+    );
   }
+  const results = await Promise.all(batch);
+  for (const r of results) urls.push(...r);
   return urls;
 }
 
 async function loadSitemaps() {
   const domain = await getDomain();
-  console.log("[Sitemap] Loading sitemap index...");
+  console.log("[Sitemap] Loading all sitemaps...");
   const startTime = Date.now();
 
-  const [movies, seasons, series] = await Promise.all([
-    fetchSitemapUrls(domain, "movies", 14),
-    fetchSitemapUrls(domain, "seasons", 4),
-    fetchSitemapUrls(domain, "series", 8),
-  ]);
+  // Overall timeout: 90s max for all sitemaps
+  const controller = new AbortController();
+  const overallTimeout = setTimeout(() => controller.abort(), 90000);
 
-  sitemapCache.movies = movies;
-  sitemapCache.seasons = seasons;
-  sitemapCache.series = series;
-  sitemapCache.ts = Date.now();
+  try {
+    const [movies, seasons, series] = await Promise.all([
+      fetchSitemapUrls(domain, "movies", 14),
+      fetchSitemapUrls(domain, "seasons", 4),
+      fetchSitemapUrls(domain, "series", 8),
+    ]);
 
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[Sitemap] Loaded ${movies.length} movies, ${seasons.length} seasons, ${series.length} series URLs in ${elapsed}s`);
+    sitemapCache.movies = movies;
+    sitemapCache.seasons = seasons;
+    sitemapCache.series = series;
+    sitemapCache.ts = Date.now();
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Sitemap] Loaded ${movies.length} movies, ${seasons.length} seasons, ${series.length} series URLs in ${elapsed}s`);
+  } catch (err) {
+    console.error(`[Sitemap] Loading failed: ${err.message}`);
+  } finally {
+    clearTimeout(overallTimeout);
+  }
 }
 
 async function getSitemaps() {
@@ -1057,6 +1065,9 @@ server.listen(PORT, () => {
   console.log(`  Health:   http://localhost:${PORT}/health`);
   console.log(`  Test:     http://localhost:${PORT}/stream/movie/tt6166392.json`);
   console.log("=".repeat(55));
+
+  // Preload sitemaps in background on startup
+  getSitemaps().then(() => console.log("[Startup] Sitemaps preloaded")).catch(() => {});
 });
 
 process.on("SIGINT", () => {
