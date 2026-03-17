@@ -2,7 +2,87 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const cheerio = require("cheerio");
 require("dotenv").config();
 
+// ── Cloudflare Cookie Harvester (Puppeteer + Stealth) ──
+let cfCookies = "";
+let cfCookieTs = 0;
+const CF_COOKIE_TTL = 10 * 60 * 1000; // 10 min (cf_clearance lasts ~15min)
+let cfHarvestPromise = null;
 
+const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+
+async function harvestCfCookies(targetUrl) {
+  if (cfCookies && Date.now() - cfCookieTs < CF_COOKIE_TTL) return cfCookies;
+  if (cfHarvestPromise) return cfHarvestPromise;
+
+  cfHarvestPromise = (async () => {
+    let browser;
+    try {
+      console.log("[CF] Launching browser for cookie harvest...");
+      const puppeteer = require("puppeteer-extra");
+      const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+      puppeteer.use(StealthPlugin());
+
+      browser = await puppeteer.launch({
+        executablePath: CHROME_PATH,
+        headless: "new",
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--no-first-run",
+          "--no-zygote",
+          "--single-process",
+          "--disable-extensions",
+        ],
+      });
+
+      const page = await browser.newPage();
+      await page.setUserAgent(UA);
+      await page.setViewport({ width: 1920, height: 1080 });
+
+      console.log(`[CF] Navigating to ${targetUrl}...`);
+      await page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
+
+      // Wait for CF challenge to resolve (check for body content change)
+      const maxWait = 20000;
+      const start = Date.now();
+      while (Date.now() - start < maxWait) {
+        const content = await page.content();
+        if (!content.includes("Just a moment") && !content.includes("Checking your browser")) {
+          break;
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      const cookies = await page.cookies();
+      const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+      console.log(`[CF] Got ${cookies.length} cookies: ${cookies.map(c => c.name).join(", ")}`);
+
+      if (cookieStr.includes("cf_clearance")) {
+        cfCookies = cookieStr;
+        cfCookieTs = Date.now();
+        console.log("[CF] cf_clearance cookie obtained!");
+      } else {
+        // Even without cf_clearance, use whatever cookies we got
+        cfCookies = cookieStr;
+        cfCookieTs = Date.now();
+        console.log("[CF] No cf_clearance, using available cookies");
+      }
+
+      await browser.close();
+      return cfCookies;
+    } catch (err) {
+      console.error("[CF] Cookie harvest failed:", err.message);
+      if (browser) try { await browser.close(); } catch {}
+      return cfCookies; // Return stale cookies if any
+    } finally {
+      cfHarvestPromise = null;
+    }
+  })();
+
+  return cfHarvestPromise;
+}
 
 // ── Caches ──
 const cache = {
@@ -102,8 +182,10 @@ async function discoverDomain() {
 
 async function testDomain(domain) {
   try {
+    const hdrs = { ...HEADERS };
+    if (cfCookies) hdrs.Cookie = cfCookies;
     const resp = await fetch(`${domain}/`, {
-      headers: HEADERS,
+      headers: hdrs,
       signal: AbortSignal.timeout(8000),
     });
     if (resp.ok) {
@@ -152,11 +234,20 @@ const HEADERS = {
 };
 
 async function fetchPage(url, retries = 2) {
+  // Ensure we have CF cookies before fetching FaselHD pages
+  if (url.includes(DOMAIN_BASE) && (!cfCookies || Date.now() - cfCookieTs > CF_COOKIE_TTL)) {
+    await harvestCfCookies(url);
+  }
+
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
+      const hdrs = { ...HEADERS, Referer: url };
+      if (cfCookies && url.includes(DOMAIN_BASE)) {
+        hdrs.Cookie = cfCookies;
+      }
       const resp = await fetch(url, {
-        headers: { ...HEADERS, Referer: url },
+        headers: hdrs,
         signal: AbortSignal.timeout(15000),
       });
 
@@ -164,8 +255,11 @@ async function fetchPage(url, retries = 2) {
       const html = await resp.text();
 
       if (html.includes("Just a moment") || html.includes("Checking your browser")) {
-        console.log("[Fetch] Cloudflare challenge");
-        if (url.includes(DOMAIN_BASE)) markDomainBad();
+        console.log("[Fetch] Cloudflare challenge detected, re-harvesting cookies...");
+        cfCookieTs = 0; // Force re-harvest
+        if (url.includes(DOMAIN_BASE)) {
+          await harvestCfCookies(url);
+        }
         continue;
       }
 
