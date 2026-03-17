@@ -207,6 +207,18 @@ async function discoverDomain() {
 
 async function testDomain(domain) {
   try {
+    // Try native fetch on sitemap (no browser needed, bypasses CF)
+    const resp = await fetch(`${domain}/sitemap_index.xml`, {
+      headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (resp.ok) {
+      const text = await resp.text();
+      if (text.includes("<sitemapindex") && text.length > 500) return true;
+    }
+  } catch {}
+  // Fallback: try browser fetch on root page
+  try {
     const html = await browserFetch(`${domain}/`, 10000);
     if (!html) return false;
     return !html.includes("Just a moment") && !html.includes("Checking your browser") && html.length > 1000;
@@ -308,26 +320,122 @@ async function getImdbInfo(imdbId) {
   return null;
 }
 
-// ── Search helpers (bypass CF-blocked /?s= endpoint) ──
+// ── Sitemap-based search (bypasses CF-blocked /?s= endpoint) ──
 
-function convertToActiveDomain(rawUrl, activeDomainUrl) {
-  try {
-    const parsed = new URL(rawUrl);
-    const active = new URL(activeDomainUrl);
-    parsed.hostname = active.hostname;
-    parsed.protocol = active.protocol;
-    parsed.port = active.port;
-    return parsed.toString().replace(/\/$/, "");
-  } catch {
-    return rawUrl;
+// Sitemap URL index — cached in memory
+const sitemapCache = {
+  movies: [],    // array of URL strings from movies-sitemap{1-14}.xml
+  seasons: [],   // array of URL strings from seasons-sitemap{1-4}.xml
+  series: [],    // array of URL strings from series-sitemap{1-8}.xml
+  ts: 0,
+};
+const SITEMAP_TTL = 6 * 60 * 60 * 1000; // 6 hours
+let sitemapLoadPromise = null;
+
+async function fetchSitemapUrls(baseUrl, prefix, maxNum) {
+  const urls = [];
+  // Download sitemaps in parallel batches of 5
+  for (let start = 1; start <= maxNum; start += 5) {
+    const batch = [];
+    for (let i = start; i < start + 5 && i <= maxNum; i++) {
+      batch.push(
+        fetch(`${baseUrl}/${prefix}-sitemap${i}.xml`, {
+          headers: { "User-Agent": UA },
+          signal: AbortSignal.timeout(15000),
+        })
+          .then(async (r) => {
+            if (!r.ok) return [];
+            const xml = await r.text();
+            if (xml.includes("Just a moment")) return [];
+            return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+          })
+          .catch(() => [])
+      );
+    }
+    const results = await Promise.all(batch);
+    for (const r of results) urls.push(...r);
   }
+  return urls;
+}
+
+async function loadSitemaps() {
+  const domain = await getDomain();
+  console.log("[Sitemap] Loading sitemap index...");
+  const startTime = Date.now();
+
+  const [movies, seasons, series] = await Promise.all([
+    fetchSitemapUrls(domain, "movies", 14),
+    fetchSitemapUrls(domain, "seasons", 4),
+    fetchSitemapUrls(domain, "series", 8),
+  ]);
+
+  sitemapCache.movies = movies;
+  sitemapCache.seasons = seasons;
+  sitemapCache.series = series;
+  sitemapCache.ts = Date.now();
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[Sitemap] Loaded ${movies.length} movies, ${seasons.length} seasons, ${series.length} series URLs in ${elapsed}s`);
+}
+
+async function getSitemaps() {
+  if (Date.now() - sitemapCache.ts < SITEMAP_TTL && sitemapCache.movies.length > 0) {
+    return sitemapCache;
+  }
+  if (!sitemapLoadPromise) {
+    sitemapLoadPromise = loadSitemaps().finally(() => { sitemapLoadPromise = null; });
+  }
+  await sitemapLoadPromise;
+  return sitemapCache;
+}
+
+function slugify(title) {
+  return title
+    .toLowerCase()
+    .replace(/[''`]/g, "")
+    .replace(/[&]/g, "and")
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .trim();
+}
+
+function searchSitemapUrls(urls, slug, year) {
+  const decoded = urls.map((u) => decodeURIComponent(u).toLowerCase());
+  const results = [];
+  for (let i = 0; i < decoded.length; i++) {
+    if (decoded[i].includes(slug)) {
+      results.push({ url: urls[i], title: "", score: 0 });
+      // Score by year match
+      if (year && decoded[i].includes(String(year))) {
+        results[results.length - 1].score += 10;
+      }
+    }
+  }
+  // Also try individual words for multi-word titles (e.g., "game-of-thrones" → try "thrones")
+  if (results.length === 0) {
+    const words = slug.split("-").filter((w) => w.length >= 4);
+    if (words.length > 1) {
+      // Try matching all significant words
+      for (let i = 0; i < decoded.length; i++) {
+        const matchCount = words.filter((w) => decoded[i].includes(w)).length;
+        if (matchCount >= Math.ceil(words.length * 0.6)) {
+          results.push({ url: urls[i], title: "", score: matchCount });
+          if (year && decoded[i].includes(String(year))) {
+            results[results.length - 1].score += 10;
+          }
+        }
+      }
+    }
+  }
+  results.sort((a, b) => b.score - a.score);
+  return results;
 }
 
 async function searchViaRSS(query, domain) {
   try {
     const url = `${domain}/feed/?s=${encodeURIComponent(query)}`;
     console.log(`[RSS] ${url}`);
-    // Try native fetch first (faster), fall back to browserFetch if CF blocks it
     let xml;
     try {
       const resp = await fetch(url, {
@@ -337,13 +445,11 @@ async function searchViaRSS(query, domain) {
       if (resp.ok) {
         xml = await resp.text();
         if (xml.includes("Just a moment") || xml.includes("Checking your browser")) {
-          console.log("[RSS] CF challenge on native fetch, trying browser...");
           xml = null;
         }
       }
     } catch {}
-    if (!xml) xml = await browserFetch(url, 15000);
-    if (!xml || xml.includes("Just a moment")) return [];
+    if (!xml) return [];
 
     const $ = cheerio.load(xml, { xmlMode: true });
     const results = [];
@@ -360,84 +466,51 @@ async function searchViaRSS(query, domain) {
   }
 }
 
-async function searchViaDuckDuckGo(query, year, domain) {
-  try {
-    const sq = `site:fasel-hd.cam ${query}${year ? " " + year : ""}`;
-    console.log(`[DDG] Searching: ${sq}`);
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(sq)}`;
-    const resp = await fetch(url, {
-      headers: { "User-Agent": UA },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!resp.ok) return [];
-    const html = await resp.text();
-
-    // Extract FaselHD URLs from DDG results (raw HTML + decoded uddg redirect params)
-    const faselRegex = /https?:\/\/(?:www\.)?(?:fasel-hd\.cam|faselhd\.club|web\d+x\.faselhdx\.best)\/(?:movies|series|seasons|anime|episodes)\/[^\s"'&<)]+/gi;
-    const decoded = [...html.matchAll(/uddg=([^&"]+)/g)]
-      .map((m) => decodeURIComponent(m[1]))
-      .join("\n");
-    const searchIn = html + "\n" + decoded;
-
-    const found = new Set();
-    let m;
-    while ((m = faselRegex.exec(searchIn)) !== null) {
-      found.add(m[0].replace(/&amp;/g, "&"));
-    }
-
-    const results = [...found].map((rawUrl) => ({
-      url: convertToActiveDomain(rawUrl, domain),
-      title: "",
-    }));
-    console.log(`[DDG] Found ${results.length} result(s)`);
-    return results;
-  } catch (err) {
-    console.error(`[DDG] ${err.message}`);
-    return [];
-  }
-}
-
 // ── FaselHD Search ──
 
 async function searchFasel(query, year, type) {
   const domain = await getDomain();
-  const cacheKey = `${query}|${year}`;
+  const cacheKey = `${query}|${year}|${type}`;
   const cached = cacheGet(cache.search, cacheKey, SEARCH_TTL);
   if (cached) return cached;
 
+  const slug = slugify(query);
+  console.log(`[Search] query="${query}" slug="${slug}" year=${year} type=${type}`);
+
   let results = [];
 
-  // Strategy 1: RSS feed (same domain, bypasses CF on search page)
-  results = await searchViaRSS(query, domain);
-
-  // Strategy 2: DuckDuckGo fallback
-  if (!results.length) results = await searchViaDuckDuckGo(query, year, domain);
-
-  // Filter by content type
+  // Strategy 1: Sitemap search (works from datacenter, no CF)
+  const sm = await getSitemaps();
   if (type === "movie") {
-    const filtered = results.filter((r) => r.url.includes("/movies/"));
-    if (filtered.length) results = filtered;
+    results = searchSitemapUrls(sm.movies, slug, year);
   } else if (type === "series") {
-    // Prefer /seasons/ (main series page), then /series/, then anything
-    const seasons = results.filter((r) => r.url.includes("/seasons/"));
-    const series = results.filter(
-      (r) => r.url.includes("/series/") || r.url.includes("/anime/")
-    );
-    if (seasons.length) results = seasons;
-    else if (series.length) results = series;
+    // Search seasons first (main series listing pages), then series (individual seasons)
+    results = searchSitemapUrls(sm.seasons, slug, year);
+    if (!results.length) results = searchSitemapUrls(sm.series, slug, year);
+  } else {
+    // Search all
+    results = [
+      ...searchSitemapUrls(sm.movies, slug, year),
+      ...searchSitemapUrls(sm.seasons, slug, year),
+      ...searchSitemapUrls(sm.series, slug, year),
+    ];
   }
 
-  // Sort: prefer results with year in URL/title
-  if (year) {
-    results.sort((a, b) => {
-      const aHas = (a.url.includes(String(year)) || a.title.includes(String(year))) ? 0 : 1;
-      const bHas = (b.url.includes(String(year)) || b.title.includes(String(year))) ? 0 : 1;
-      return aHas - bHas;
-    });
+  // Strategy 2: RSS feed fallback (works from residential IPs)
+  if (!results.length) {
+    results = await searchViaRSS(query, domain);
+    // Filter by type
+    if (type === "movie") {
+      const f = results.filter((r) => r.url.includes("/movies/"));
+      if (f.length) results = f;
+    } else if (type === "series") {
+      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/"));
+      if (f.length) results = f;
+    }
   }
 
   console.log(`[Search] "${query}" → ${results.length} result(s)`);
-  results.forEach((r, i) => console.log(`  ${i}: ${r.title} → ${r.url}`));
+  results.slice(0, 5).forEach((r, i) => console.log(`  ${i}: ${r.url}`));
   if (results.length > 0) cacheSet(cache.search, cacheKey, results);
   return results;
 }
@@ -935,166 +1008,76 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Diagnostic: test different browser configs to find what bypasses CF
+  // Diagnostic: test sitemap search + direct page access from this server
   if (req.url === "/diag") {
     const results = {};
-    const browser = await getBrowser();
 
-    // Test 1: Root page, NO request interception (like the old version that worked)
+    // Test 1: Sitemap fetch (native fetch, no browser needed)
     try {
-      const page1 = await browser.newPage();
-      await page1.setUserAgent(UA);
-      await page1.setViewport({ width: 1920, height: 1080 });
-      await page1.goto(`${activeDomain}/`, { waitUntil: "networkidle2", timeout: 30000 });
-      const html1 = await page1.content();
-      results.test1_root_noIntercept = {
-        length: html1.length,
-        cf: html1.includes("Just a moment"),
-        hasPostDiv: html1.includes("postDiv"),
-        title: (html1.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      const smUrl = `${activeDomain}/movies-sitemap3.xml`;
+      const smResp = await fetch(smUrl, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15000) });
+      const smXml = await smResp.text();
+      const smCf = smXml.includes("Just a moment");
+      const smUrls = [...smXml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1]);
+      const inception = smUrls.filter(u => u.toLowerCase().includes("inception"));
+      results.test1_sitemap_nativeFetch = {
+        status: smResp.status,
+        length: smXml.length,
+        cf: smCf,
+        urlCount: smUrls.length,
+        inceptionFound: inception.length > 0,
+        inceptionUrl: inception[0] || null,
       };
-      await page1.close();
-    } catch (e) { results.test1_root_noIntercept = { error: e.message }; }
+    } catch (e) { results.test1_sitemap_nativeFetch = { error: e.message }; }
 
-    // Test 2: Search page, NO request interception
+    // Test 2: Full sitemap search for "Inception"
     try {
-      const page2 = await browser.newPage();
-      await page2.setUserAgent(UA);
-      await page2.setViewport({ width: 1920, height: 1080 });
-      await page2.goto(`${activeDomain}/?s=Inception`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      const sm = await getSitemaps();
+      const slug = slugify("Inception");
+      const movieResults = searchSitemapUrls(sm.movies, slug, 2010);
+      results.test2_sitemapSearch = {
+        movieCount: sm.movies.length,
+        seasonCount: sm.seasons.length,
+        seriesCount: sm.series.length,
+        searchSlug: slug,
+        found: movieResults.length,
+        urls: movieResults.slice(0, 3).map(r => r.url),
+      };
+    } catch (e) { results.test2_sitemapSearch = { error: e.message }; }
+
+    // Test 3: Direct movie page via browser
+    try {
+      const browser = await getBrowser();
+      const inceptionUrl = results.test1_sitemap_nativeFetch?.inceptionUrl || `${activeDomain}/movies/1-1%d9%81%d9%8a%d9%84%d9%85-inception-2010-%d9%85%d8%aa%d8%b1%d8%ac%d9%85-lk`;
+      const page = await browser.newPage();
+      await page.setUserAgent(UA);
+      await page.setViewport({ width: 1920, height: 1080 });
+      await page.goto(inceptionUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
       await new Promise(r => setTimeout(r, 2000));
-      const html2 = await page2.content();
-      results.test2_search_noIntercept = {
-        length: html2.length,
-        cf: html2.includes("Just a moment"),
-        hasPostDiv: html2.includes("postDiv"),
-        title: (html2.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      const html = await page.content();
+      results.test3_directPage_browser = {
+        length: html.length,
+        cf: html.includes("Just a moment"),
+        hasPlayerToken: html.includes("player_token"),
+        title: (html.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
       };
-      await page2.close();
-    } catch (e) { results.test2_search_noIntercept = { error: e.message }; }
+      await page.close();
+    } catch (e) { results.test3_directPage_browser = { error: e.message }; }
 
-    // Test 3: Search page, WITH request interception (blocking images/fonts/css)
+    // Test 4: Series sitemap search for "Breaking Bad"
     try {
-      const page3 = await browser.newPage();
-      await page3.setUserAgent(UA);
-      await page3.setViewport({ width: 1920, height: 1080 });
-      await page3.setRequestInterception(true);
-      page3.on("request", (r) => {
-        const t = r.resourceType();
-        if (["image", "font", "media", "stylesheet"].includes(t)) r.abort();
-        else r.continue();
-      });
-      await page3.goto(`${activeDomain}/?s=Inception`, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
-      const html3 = await page3.content();
-      results.test3_search_withIntercept = {
-        length: html3.length,
-        cf: html3.includes("Just a moment"),
-        hasPostDiv: html3.includes("postDiv"),
-        title: (html3.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      const sm = await getSitemaps();
+      const slug = slugify("Breaking Bad");
+      const seasonResults = searchSitemapUrls(sm.seasons, slug, null);
+      const seriesResults = searchSitemapUrls(sm.series, slug, null);
+      results.test4_seriesSearch = {
+        searchSlug: slug,
+        seasonsFound: seasonResults.length,
+        seriesFound: seriesResults.length,
+        seasonUrls: seasonResults.slice(0, 3).map(r => r.url),
+        seriesUrls: seriesResults.slice(0, 3).map(r => r.url),
       };
-      await page3.close();
-    } catch (e) { results.test3_search_withIntercept = { error: e.message }; }
-
-    // Test 4: Root page first (warm cookies), then search page in same context
-    try {
-      const page4 = await browser.newPage();
-      await page4.setUserAgent(UA);
-      await page4.setViewport({ width: 1920, height: 1080 });
-      await page4.goto(`${activeDomain}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
-      const rootHtml = await page4.content();
-      const rootCf = rootHtml.includes("Just a moment");
-      // Now navigate to search
-      await page4.goto(`${activeDomain}/?s=Inception`, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
-      const html4 = await page4.content();
-      results.test4_root_then_search = {
-        rootCf,
-        length: html4.length,
-        cf: html4.includes("Just a moment"),
-        hasPostDiv: html4.includes("postDiv"),
-        title: (html4.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
-      };
-      await page4.close();
-    } catch (e) { results.test4_root_then_search = { error: e.message }; }
-
-    // Test 5: Direct movie page (NOT search)
-    try {
-      const page5 = await browser.newPage();
-      await page5.setUserAgent(UA);
-      await page5.setViewport({ width: 1920, height: 1080 });
-      await page5.goto(`${activeDomain}/movies/1-1%d9%81%d9%8a%d9%84%d9%85-inception-2010-%d9%85%d8%aa%d8%b1%d8%ac%d9%85-lk`, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
-      const html5 = await page5.content();
-      results.test5_directMoviePage = {
-        length: html5.length,
-        cf: html5.includes("Just a moment"),
-        hasPlayerToken: html5.includes("player_token"),
-        title: (html5.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
-      };
-      await page5.close();
-    } catch (e) { results.test5_directMoviePage = { error: e.message }; }
-
-    // Test 6: Google search for FaselHD content
-    try {
-      const page6 = await browser.newPage();
-      await page6.setUserAgent(UA);
-      await page6.setViewport({ width: 1920, height: 1080 });
-      const gUrl = `https://www.google.com/search?q=site:faselhdx.best+Inception+2010`;
-      await page6.goto(gUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-      await new Promise(r => setTimeout(r, 2000));
-      const html6 = await page6.content();
-      // Extract links from Google results
-      const links = [];
-      const linkRegex = /https?:\/\/web\d+x\.faselhdx\.best\/[^"&\s]+/g;
-      let m;
-      while ((m = linkRegex.exec(html6)) !== null) links.push(m[0]);
-      results.test6_googleSearch = {
-        length: html6.length,
-        linksFound: links.length,
-        links: links.slice(0, 5),
-      };
-      await page6.close();
-    } catch (e) { results.test6_googleSearch = { error: e.message }; }
-
-    // Test 7: RSS feed search (native fetch)
-    try {
-      const rssUrl = `${activeDomain}/feed/?s=Inception`;
-      const rssResp = await fetch(rssUrl, {
-        headers: { ...HEADERS, Accept: "application/rss+xml,application/xml" },
-        signal: AbortSignal.timeout(10000),
-      });
-      const rssText = await rssResp.text();
-      const isCf = rssText.includes("Just a moment");
-      const itemCount = (rssText.match(/<item>/g) || []).length;
-      const links = [...rssText.matchAll(/<link>([^<]+)<\/link>/g)].map(m => m[1]).filter(l => l.includes("/movies/") || l.includes("/seasons/") || l.includes("/series/"));
-      results.test7_rssFeed_nativeFetch = {
-        status: rssResp.status,
-        length: rssText.length,
-        cf: isCf,
-        items: itemCount,
-        contentLinks: links.slice(0, 5),
-      };
-    } catch (e) { results.test7_rssFeed_nativeFetch = { error: e.message }; }
-
-    // Test 8: RSS feed search (via browser)
-    try {
-      const rssUrl2 = `${activeDomain}/feed/?s=Inception`;
-      const page8 = await browser.newPage();
-      await page8.setUserAgent(UA);
-      await page8.goto(rssUrl2, { waitUntil: "domcontentloaded", timeout: 15000 });
-      await new Promise(r => setTimeout(r, 1000));
-      const rssHtml = await page8.content();
-      const isCf8 = rssHtml.includes("Just a moment");
-      const links8 = [...rssHtml.matchAll(/https?:\/\/[^<"]+\/(?:movies|seasons|series)\/[^<"]+/g)].map(m => m[0]);
-      results.test8_rssFeed_browser = {
-        length: rssHtml.length,
-        cf: isCf8,
-        contentLinks: links8.slice(0, 5),
-      };
-      await page8.close();
-    } catch (e) { results.test8_rssFeed_browser = { error: e.message }; }
+    } catch (e) { results.test4_seriesSearch = { error: e.message }; }
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(results, null, 2));
