@@ -63,9 +63,11 @@ async function browserFetch(url, timeout = 45000) {
 
     console.log(`[Browser] Navigating: ${url}`);
     const response = await page.goto(url, {
-      waitUntil: "networkidle2",
+      waitUntil: "domcontentloaded",
       timeout,
     });
+    // Extra wait for dynamic content to render
+    await new Promise(r => setTimeout(r, 2000));
 
     // Wait for CF challenge to resolve (Turnstile may need interaction)
     const content = await page.content();
@@ -878,7 +880,8 @@ const server = http.createServer(async (req, res) => {
       const page2 = await browser.newPage();
       await page2.setUserAgent(UA);
       await page2.setViewport({ width: 1920, height: 1080 });
-      await page2.goto(`${activeDomain}/?s=Inception`, { waitUntil: "networkidle2", timeout: 30000 });
+      await page2.goto(`${activeDomain}/?s=Inception`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
       const html2 = await page2.content();
       results.test2_search_noIntercept = {
         length: html2.length,
@@ -900,7 +903,8 @@ const server = http.createServer(async (req, res) => {
         if (["image", "font", "media", "stylesheet"].includes(t)) r.abort();
         else r.continue();
       });
-      await page3.goto(`${activeDomain}/?s=Inception`, { waitUntil: "networkidle2", timeout: 30000 });
+      await page3.goto(`${activeDomain}/?s=Inception`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
       const html3 = await page3.content();
       results.test3_search_withIntercept = {
         length: html3.length,
@@ -916,11 +920,13 @@ const server = http.createServer(async (req, res) => {
       const page4 = await browser.newPage();
       await page4.setUserAgent(UA);
       await page4.setViewport({ width: 1920, height: 1080 });
-      await page4.goto(`${activeDomain}/`, { waitUntil: "networkidle2", timeout: 30000 });
+      await page4.goto(`${activeDomain}/`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
       const rootHtml = await page4.content();
       const rootCf = rootHtml.includes("Just a moment");
       // Now navigate to search
-      await page4.goto(`${activeDomain}/?s=Inception`, { waitUntil: "networkidle2", timeout: 30000 });
+      await page4.goto(`${activeDomain}/?s=Inception`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
       const html4 = await page4.content();
       results.test4_root_then_search = {
         rootCf,
