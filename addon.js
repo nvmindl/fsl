@@ -938,6 +938,45 @@ const server = http.createServer(async (req, res) => {
       await page4.close();
     } catch (e) { results.test4_root_then_search = { error: e.message }; }
 
+    // Test 5: Direct movie page (NOT search)
+    try {
+      const page5 = await browser.newPage();
+      await page5.setUserAgent(UA);
+      await page5.setViewport({ width: 1920, height: 1080 });
+      await page5.goto(`${activeDomain}/movies/1-1%d9%81%d9%8a%d9%84%d9%85-inception-2010-%d9%85%d8%aa%d8%b1%d8%ac%d9%85-lk`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
+      const html5 = await page5.content();
+      results.test5_directMoviePage = {
+        length: html5.length,
+        cf: html5.includes("Just a moment"),
+        hasPlayerToken: html5.includes("player_token"),
+        title: (html5.match(/<title>([^<]*)<\/title>/) || [])[1] || "none",
+      };
+      await page5.close();
+    } catch (e) { results.test5_directMoviePage = { error: e.message }; }
+
+    // Test 6: Google search for FaselHD content
+    try {
+      const page6 = await browser.newPage();
+      await page6.setUserAgent(UA);
+      await page6.setViewport({ width: 1920, height: 1080 });
+      const gUrl = `https://www.google.com/search?q=site:faselhdx.best+Inception+2010`;
+      await page6.goto(gUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await new Promise(r => setTimeout(r, 2000));
+      const html6 = await page6.content();
+      // Extract links from Google results
+      const links = [];
+      const linkRegex = /https?:\/\/web\d+x\.faselhdx\.best\/[^"&\s]+/g;
+      let m;
+      while ((m = linkRegex.exec(html6)) !== null) links.push(m[0]);
+      results.test6_googleSearch = {
+        length: html6.length,
+        linksFound: links.length,
+        links: links.slice(0, 5),
+      };
+      await page6.close();
+    } catch (e) { results.test6_googleSearch = { error: e.message }; }
+
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(results, null, 2));
     return;
