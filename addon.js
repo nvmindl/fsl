@@ -220,7 +220,7 @@ async function getImdbInfo(imdbId) {
 
 // ── FaselHD Search ──
 
-async function searchFasel(query, year) {
+async function searchFasel(query, year, type) {
   const domain = await getDomain();
   const url = `${domain}/?s=${encodeURIComponent(query)}`;
   const html = await fetchPage(url);
@@ -242,14 +242,29 @@ async function searchFasel(query, year) {
     }
   });
 
-  // If year provided, sort results so matching year comes first
-  if (year) {
-    results.sort((a, b) => {
+  // Sort by relevance: type match first, then year match
+  // FaselHD prefixes: مسلسل = series, فيلم = movie, انمي = anime
+  const seriesWords = /مسلسل|anime|انمي/i;
+  const movieWords = /فيلم|movie/i;
+  results.sort((a, b) => {
+    // Type match priority
+    if (type === "series") {
+      const aMatch = seriesWords.test(a.title) || seriesWords.test(a.url) ? 0 : 1;
+      const bMatch = seriesWords.test(b.title) || seriesWords.test(b.url) ? 0 : 1;
+      if (aMatch !== bMatch) return aMatch - bMatch;
+    } else if (type === "movie") {
+      const aMatch = movieWords.test(a.title) || movieWords.test(a.url) ? 0 : 1;
+      const bMatch = movieWords.test(b.title) || movieWords.test(b.url) ? 0 : 1;
+      if (aMatch !== bMatch) return aMatch - bMatch;
+    }
+    // Year match secondary
+    if (year) {
       const aHas = a.title.includes(String(year)) || a.url.includes(String(year)) ? 0 : 1;
       const bHas = b.title.includes(String(year)) || b.url.includes(String(year)) ? 0 : 1;
       return aHas - bHas;
-    });
-  }
+    }
+    return 0;
+  });
 
   console.log(`[Search] "${query}" → ${results.length} results`);
   results.forEach((r, i) => console.log(`  ${i}: ${r.title}`));
@@ -266,14 +281,24 @@ async function getPlayerTokens(url) {
   const tokens = [];
   const seen = new Set();
 
-  // Extract player_token from iframes (data-src and src)
+  // Extract quality badge from page
   const $ = cheerio.load(html);
+  const qualityBadge = $(".quality, .مشاهدة").first().text().trim() ||
+    (html.match(/(?:quality|الجودة)[^<]*?([0-9]{3,4}p[^<]{0,20})/i) || [])[1] || "";
+
+  // Extract player_token from iframes (data-src and src)
+  let serverNum = 0;
   $("iframe").each((_, el) => {
     const src = $(el).attr("data-src") || $(el).attr("src") || "";
     const m = src.match(/player_token=([^"'&\s]+)/);
     if (m && !seen.has(m[1])) {
       seen.add(m[1]);
-      tokens.push(src.startsWith("//") ? `https:${src}` : src);
+      serverNum++;
+      tokens.push({
+        url: src.startsWith("//") ? `https:${src}` : src,
+        name: `Server #${String(serverNum).padStart(2, "0")}`,
+        quality: qualityBadge,
+      });
     }
   });
 
@@ -283,9 +308,14 @@ async function getPlayerTokens(url) {
     const m = onclick.match(/player_token=([^"'&\s]+)/);
     if (m && !seen.has(m[1])) {
       seen.add(m[1]);
+      serverNum++;
       const text = $(el).text().trim();
       const domain = new URL(url).origin;
-      tokens.push(`${domain}/video_player?player_token=${m[1]}`);
+      tokens.push({
+        url: `${domain}/video_player?player_token=${m[1]}`,
+        name: text || `Server #${String(serverNum).padStart(2, "0")}`,
+        quality: qualityBadge,
+      });
       console.log(`[Parse] Server: ${text}`);
     }
   });
@@ -298,7 +328,12 @@ async function getPlayerTokens(url) {
     const tkm = rm[0].match(/player_token=([^"'&\s]+)/);
     if (tkm && !seen.has(tkm[1])) {
       seen.add(tkm[1]);
-      tokens.push(rm[0]);
+      serverNum++;
+      tokens.push({
+        url: rm[0],
+        name: `Server #${String(serverNum).padStart(2, "0")}`,
+        quality: qualityBadge,
+      });
     }
   }
 
@@ -552,10 +587,10 @@ async function resolve(imdbId, type, season, episode) {
 
   let results = [];
   for (const q of queries) {
-    results = await searchFasel(q, info.year);
+    results = await searchFasel(q, info.year, type);
     if (results.length > 0) break;
     if (info.year) {
-      results = await searchFasel(`${q} ${info.year}`, info.year);
+      results = await searchFasel(`${q} ${info.year}`, info.year, type);
       if (results.length > 0) break;
     }
   }
@@ -614,14 +649,14 @@ async function resolve(imdbId, type, season, episode) {
   }
 
   // Get player_token URLs from the page
-  const playerUrls = await getPlayerTokens(targetUrl);
+  const players = await getPlayerTokens(targetUrl);
 
-  // Try each player to extract stream
-  for (const pUrl of playerUrls) {
-    const stream = await extractStreamFromPlayer(pUrl);
-    if (stream) {
-      streams.push(stream);
-      break; // one good stream is enough
+  // Extract streams from all servers (sequential — mocks use global)
+  for (const p of players) {
+    const s = await extractStreamFromPlayer(p.url);
+    if (s) {
+      const label = [p.quality, p.name].filter(Boolean).join(" | ");
+      streams.push({ url: s.url, title: label || "FaselHD" });
     }
   }
 
