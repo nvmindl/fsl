@@ -374,26 +374,37 @@ function searchInXml(xml, slug, year) {
   return results;
 }
 
-// Search across sitemaps of a given type, stopping early when found
+// Search across sitemaps of a given type in parallel, stopping early when found
 async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   const allResults = [];
+  let found = false;
+
+  // Fetch all sitemaps in parallel, process results as they arrive
+  const fetches = [];
   for (let i = 1; i <= maxNum; i++) {
-    try {
-      const resp = await fetch(`${domain}/${prefix}-sitemap${i}.xml`, {
+    fetches.push(
+      fetch(`${domain}/${prefix}-sitemap${i}.xml`, {
         headers: { "User-Agent": UA },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!resp.ok) continue;
-      const xml = await resp.text();
-      if (xml.includes("Just a moment")) continue;
-      const found = searchInXml(xml, slug, year);
-      allResults.push(...found);
-      // If we found good matches (with year), stop early
-      if (allResults.some(r => r.score >= 10)) break;
-    } catch (e) {
-      console.log(`[Sitemap] ${prefix}-sitemap${i}: ${e.message}`);
-    }
+        signal: AbortSignal.timeout(12000),
+      })
+        .then(async (resp) => {
+          if (!resp.ok || found) return;
+          const xml = await resp.text();
+          if (xml.includes("Just a moment")) return;
+          const matches = searchInXml(xml, slug, year);
+          if (matches.length > 0) {
+            allResults.push(...matches);
+            // If we found a match with year, mark as found
+            if (matches.some(r => r.score >= 10)) found = true;
+          }
+        })
+        .catch(() => {})
+    );
   }
+  await Promise.all(fetches);
+
+  // If no exact year match but we have results, that's fine
+  if (allResults.length === 0 && !found) return [];
   allResults.sort((a, b) => b.score - a.score);
   return allResults;
 }
