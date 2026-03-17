@@ -116,8 +116,9 @@ async function testDomain(domain) {
     const { body, statusCode } = await got({
       url: `${domain}/`,
       headerGeneratorOptions: { browsers: [{ name: "chrome", minVersion: 120 }], devices: ["desktop"], operatingSystems: ["windows"] },
-      timeout: { request: 6000 },
-      followRedirect: false,
+      timeout: { request: 8000 },
+      followRedirect: true,
+      maxRedirects: 3,
     });
     if (statusCode === 200) {
       return !body.includes("Just a moment") && !body.includes("Checking your browser");
