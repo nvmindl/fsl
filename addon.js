@@ -53,7 +53,7 @@ async function getBrowser() {
 }
 
 // Fetch a page using Puppeteer (bypasses CF)
-async function browserFetch(url, timeout = 20000) {
+async function browserFetch(url, timeout = 45000) {
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
@@ -77,14 +77,32 @@ async function browserFetch(url, timeout = 20000) {
       timeout,
     });
 
-    // Wait briefly for any CF challenge to resolve
+    // Wait for CF challenge to resolve (Turnstile may need interaction)
     const content = await page.content();
     if (content.includes("Just a moment") || content.includes("Checking your browser")) {
-      console.log("[Browser] CF challenge detected, waiting...");
+      console.log("[Browser] CF challenge detected, waiting for resolution...");
+
+      // Try to click the Turnstile checkbox if it appears in an iframe
+      try {
+        await new Promise(r => setTimeout(r, 3000)); // Wait for Turnstile iframe to load
+        const frames = page.frames();
+        for (const frame of frames) {
+          const turnstileBox = await frame.$('input[type="checkbox"], .cb-lb');
+          if (turnstileBox) {
+            console.log("[Browser] Clicking Turnstile checkbox...");
+            await turnstileBox.click();
+            break;
+          }
+        }
+      } catch (e) {
+        console.log("[Browser] Turnstile click attempt:", e.message);
+      }
+
+      // Wait up to 30s for challenge to resolve
       await page.waitForFunction(
-        () => !document.body.innerHTML.includes("Just a moment"),
-        { timeout: 15000 }
-      ).catch(() => {});
+        () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+        { timeout: 30000 }
+      ).catch(() => console.log("[Browser] CF challenge did not resolve in time"));
     }
 
     const html = await page.content();
