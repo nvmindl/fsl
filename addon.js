@@ -156,7 +156,7 @@ function cacheSet(store, key, data) {
 const DOMAIN_BASE = "faselhdx";
 const MAIN_DOMAIN = "https://www.fasel-hd.cam";
 function isFaselUrl(url) { return url.includes(DOMAIN_BASE) || url.includes("fasel-hd.cam") || url.includes("faselhd."); }
-let activeDomain = process.env.FASELHDX_DOMAIN || MAIN_DOMAIN;
+let activeDomain = MAIN_DOMAIN;
 let domainLastCheck = 0; // Force discovery on first request
 const DOMAIN_TTL = 10 * 60 * 1000; // 10 min
 let domainDiscoveryPromise = null;
