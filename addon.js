@@ -87,32 +87,84 @@ function withBrowserLock(fn) {
   return p;
 }
 
+// ── CF Cookie Cache ──
+// After Puppeteer bypasses CF, we extract cookies and reuse them with fast HTTP fetch
+let cfCookies = ""; // "cf_clearance=...; __cf_bm=..." etc.
+let cfCookiesDomain = "";
+let cfCookiesTs = 0;
+const CF_COOKIE_TTL = 8 * 60 * 1000; // CF cookies last ~15min, refresh at 8min
+
+async function extractCfCookies(page) {
+  try {
+    const cookies = await page.cookies();
+    const relevant = cookies.filter(c => c.name.startsWith("cf_") || c.name.startsWith("__cf"));
+    if (relevant.length > 0) {
+      cfCookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+      cfCookiesDomain = new URL(page.url()).hostname;
+      cfCookiesTs = Date.now();
+      console.log(`[CF] Cached ${relevant.length} CF cookie(s) for ${cfCookiesDomain}`);
+    }
+  } catch {}
+}
+
+function getCfCookies(url) {
+  if (!cfCookies || Date.now() - cfCookiesTs > CF_COOKIE_TTL) return null;
+  try {
+    const host = new URL(url).hostname;
+    // Cookies work for same domain or subdomains
+    if (host === cfCookiesDomain || host.endsWith("." + cfCookiesDomain) || cfCookiesDomain.endsWith("." + host)) {
+      return cfCookies;
+    }
+  } catch {}
+  return null;
+}
+
+// Fast HTTP fetch using cached CF cookies (no browser needed)
+async function fastFetch(url) {
+  const cookies = getCfCookies(url);
+  if (!cookies) return null;
+  try {
+    const resp = await fetch(url, {
+      headers: { ...HEADERS, Cookie: cookies, Referer: url },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    if (html.includes("Just a moment") || html.includes("Checking your browser")) {
+      console.log("[FastFetch] CF challenge — cookies expired");
+      cfCookies = ""; // invalidate
+      return null;
+    }
+    if (html.length < 500) return null; // too short, probably error
+    return html;
+  } catch {
+    return null;
+  }
+}
+
 // Fetch a page using Puppeteer (bypasses CF)
-async function browserFetch(url, timeout = 45000) {
+async function browserFetch(url, timeout = 30000) {
   return withBrowserLock(async () => {
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
     await page.setUserAgent(UA);
-    await page.setViewport({ width: 1920, height: 1080 });
-    // NOTE: Do NOT use request interception — aborting CSS/images triggers CF detection
+    await page.setViewport({ width: 1280, height: 720 });
 
     console.log(`[Browser] Navigating: ${url}`);
     const response = await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout,
     });
-    // Extra wait for dynamic content to render
-    await new Promise(r => setTimeout(r, 2000));
 
-    // Wait for CF challenge to resolve (Turnstile may need interaction)
+    // Check for CF challenge
     const content = await page.content();
     if (content.includes("Just a moment") || content.includes("Checking your browser")) {
-      console.log("[Browser] CF challenge detected, waiting for resolution...");
+      console.log("[Browser] CF challenge detected, waiting...");
 
-      // Try to click the Turnstile checkbox if it appears in an iframe
+      // Try to click the Turnstile checkbox
       try {
-        await new Promise(r => setTimeout(r, 3000)); // Wait for Turnstile iframe to load
+        await new Promise(r => setTimeout(r, 2000));
         const frames = page.frames();
         for (const frame of frames) {
           const turnstileBox = await frame.$('input[type="checkbox"], .cb-lb');
@@ -126,10 +178,9 @@ async function browserFetch(url, timeout = 45000) {
         console.log("[Browser] Turnstile click attempt:", e.message);
       }
 
-      // Wait up to 30s for challenge to resolve
       await page.waitForFunction(
         () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
-        { timeout: 30000 }
+        { timeout: 20000 }
       ).catch(() => console.log("[Browser] CF challenge did not resolve in time"));
     }
 
@@ -138,7 +189,10 @@ async function browserFetch(url, timeout = 45000) {
     const status = response ? response.status() : 0;
     console.log(`[Browser] ${url.substring(0, 60)}... → ${status} (${html.length} chars)`);
 
-    // Detect domain rotation: if we were redirected to a different domain
+    // Extract CF cookies for reuse by fast HTTP fetch
+    await extractCfCookies(page);
+
+    // Detect domain rotation
     if (isFaselUrl(url) && !isFaselUrl(finalUrl)) {
       console.log(`[Browser] Domain rotated! ${url} → ${finalUrl}`);
       markDomainBad();
@@ -340,35 +394,41 @@ async function fetchPage(url, retries = 2) {
     try {
       console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
 
-      // Use Puppeteer for FaselHD pages, native fetch for others
       let html;
       if (isFaselUrl(url)) {
-        // Quick check: is the domain still alive? (native fetch, no browser needed)
+        // Try fast HTTP fetch with cached CF cookies first
+        html = await fastFetch(url);
+        if (html) {
+          console.log(`[Fetch] Fast fetch OK (${html.length} chars)`);
+          return html;
+        }
+
+        // Quick redirect check before launching browser
         try {
           const checkResp = await fetch(url, {
             redirect: "manual",
             headers: { "User-Agent": UA },
-            signal: AbortSignal.timeout(5000),
+            signal: AbortSignal.timeout(4000),
           });
           if (checkResp.status >= 300 && checkResp.status < 400) {
             const loc = checkResp.headers.get("location") || "";
-            // Only rotate if redirect goes to a different base domain
             const urlHost = new URL(url).hostname;
             const locHost = loc ? new URL(loc).hostname : "";
             if (locHost && locHost !== urlHost) {
-              console.log(`[Fetch] Domain returned ${checkResp.status} → ${loc}, rotating...`);
+              console.log(`[Fetch] Domain rotated ${checkResp.status} → ${loc}`);
               markDomainBad();
               const newDomain = await getDomain();
               url = url.replace(/https?:\/\/[^/]+/, newDomain);
-              console.log(`[Fetch] Retrying with new domain: ${url}`);
             }
           }
         } catch {}
+
+        // Fall back to Puppeteer
         html = await browserFetch(url);
       } else {
         const resp = await fetch(url, {
           headers: { ...HEADERS, Referer: url },
-          signal: AbortSignal.timeout(15000),
+          signal: AbortSignal.timeout(10000),
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         html = await resp.text();
@@ -377,7 +437,8 @@ async function fetchPage(url, retries = 2) {
       if (!html) throw new Error("Empty response");
 
       if (html.includes("Just a moment") || html.includes("Checking your browser")) {
-        console.log("[Fetch] Cloudflare challenge page returned");
+        console.log("[Fetch] CF challenge — need browser");
+        cfCookies = ""; // invalidate cookies
         continue;
       }
 
@@ -1114,6 +1175,15 @@ const server = http.createServer(async (req, res) => {
       // If it's an m3u8, rewrite URLs inside to go through proxy
       if (ct.includes("mpegurl") || targetUrl.endsWith(".m3u8")) {
         let body = await upstream.text();
+
+        // Verify we got actual m3u8 content, not an HTML error page
+        if (body.includes("<!DOCTYPE") || body.includes("<html") || (!body.includes("#EXTM3U") && !body.includes("#EXT-X"))) {
+          console.log(`[Proxy] Upstream returned HTML instead of m3u8 (${body.length} chars)`);
+          res.writeHead(502, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+          res.end("Stream expired or unavailable");
+          return;
+        }
+
         // Rewrite absolute URLs
         body = body.replace(/^(https?:\/\/[^\s]+)/gm, (url) => {
           const trimmed = url.trim();
