@@ -2,18 +2,34 @@ const { addonBuilder } = require("stremio-addon-sdk");
 const cheerio = require("cheerio");
 require("dotenv").config();
 
-// ── Persistent Puppeteer Browser (CF bypass) ──
+// ── Puppeteer Browser (CF bypass) — auto-close after idle to save memory ──
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 let browserInstance = null;
 let browserLaunchPromise = null;
+let browserIdleTimer = null;
+const BROWSER_IDLE_MS = 60_000; // close browser after 60s idle
+
+function resetBrowserIdle() {
+  if (browserIdleTimer) clearTimeout(browserIdleTimer);
+  browserIdleTimer = setTimeout(async () => {
+    if (browserInstance && browserInstance.isConnected()) {
+      console.log("[Browser] Idle timeout, closing to free memory");
+      try { await browserInstance.close(); } catch {}
+      browserInstance = null;
+    }
+  }, BROWSER_IDLE_MS);
+}
 
 async function getBrowser() {
-  if (browserInstance && browserInstance.isConnected()) return browserInstance;
+  if (browserInstance && browserInstance.isConnected()) {
+    resetBrowserIdle();
+    return browserInstance;
+  }
   if (browserLaunchPromise) return browserLaunchPromise;
 
   browserLaunchPromise = (async () => {
     try {
-      console.log("[Browser] Launching persistent browser...");
+      console.log("[Browser] Launching browser...");
       const puppeteer = require("puppeteer-extra");
       const StealthPlugin = require("puppeteer-extra-plugin-stealth");
       puppeteer.use(StealthPlugin());
@@ -30,14 +46,25 @@ async function getBrowser() {
           "--no-zygote",
           "--single-process",
           "--disable-extensions",
+          "--disable-software-rasterizer",
+          "--disable-background-networking",
+          "--disable-default-apps",
+          "--disable-sync",
+          "--disable-translate",
+          "--metrics-recording-only",
+          "--mute-audio",
+          "--no-default-browser-check",
+          "--js-flags=--max-old-space-size=128",
         ],
       });
 
       browserInstance.on("disconnected", () => {
         console.log("[Browser] Disconnected");
         browserInstance = null;
+        if (browserIdleTimer) clearTimeout(browserIdleTimer);
       });
 
+      resetBrowserIdle();
       console.log("[Browser] Ready");
       return browserInstance;
     } catch (err) {
@@ -146,7 +173,7 @@ function cacheGet(store, key, ttl) {
 function cacheSet(store, key, data) {
   store.set(key, { data, ts: Date.now() });
   // Evict old entries if cache grows too large
-  if (store.size > 500) {
+  if (store.size > 100) {
     const oldest = store.keys().next().value;
     store.delete(oldest);
   }
