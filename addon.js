@@ -147,9 +147,9 @@ async function fastFetch(url) {
 }
 
 // ── Worker page: persistent browser tab for FaselHD content ──
-// CF challenges full page navigations with Turnstile (can't auto-solve).
-// But CF does NOT challenge same-origin fetch() from within an already-loaded page.
-// So: load homepage once → use in-page fetch() for all content pages.
+// CF challenges each NEW tab with Turnstile (can't auto-solve).
+// But navigating the SAME tab to different URLs keeps the CF session alive.
+// So: load homepage once (pass CF), then navigate the same tab to content pages.
 let workerPage = null;
 let workerDomain = null;
 
@@ -172,7 +172,7 @@ async function ensureWorkerPage() {
 
   await workerPage.goto(domain + "/", { waitUntil: "domcontentloaded", timeout: 25000 });
 
-  // Handle CF challenge on homepage (lightweight, solvable)
+  // Handle CF challenge on homepage
   const content = await workerPage.content();
   if (content.includes("Just a moment") || content.includes("Checking your browser")) {
     console.log("[Worker] CF challenge on homepage...");
@@ -195,46 +195,63 @@ async function ensureWorkerPage() {
   return workerPage;
 }
 
+// Fetch a FaselHD page by navigating the worker tab (same CF session)
+async function workerNavigate(url, timeout = 20000) {
+  const page = await ensureWorkerPage();
+  console.log(`[Worker] Navigating: ${url.substring(0, 80)}...`);
+
+  const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+
+  // Quick CF check — worker tab usually passes without Turnstile
+  const content = await page.content();
+  if (content.includes("Just a moment") || content.includes("Checking your browser")) {
+    console.log("[Worker] CF on content page, waiting...");
+    await page.waitForFunction(
+      () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+      { timeout: 15000 }
+    ).catch(() => {});
+  }
+
+  const html = await page.content();
+  const finalUrl = page.url();
+  const status = response ? response.status() : 0;
+  console.log(`[Worker] ${status} (${html.length} chars)`);
+
+  // Detect domain rotation
+  if (isFaselUrl(url) && !isFaselUrl(finalUrl)) {
+    console.log(`[Worker] Domain rotated! → ${finalUrl}`);
+    markDomainBad();
+    return null;
+  }
+
+  // If still CF-blocked, return null
+  if (html.includes("Just a moment") || html.includes("Checking your browser") || html.length < 1000) {
+    console.log("[Worker] Still CF-blocked, invalidating session");
+    workerPage = null;
+    workerDomain = null;
+    return null;
+  }
+
+  return html;
+}
+
 // Fetch a page using Puppeteer
 async function browserFetch(url, timeout = 30000) {
   return withBrowserLock(async () => {
-    // For FaselHD: use worker page with in-page fetch (bypasses per-page CF Turnstile)
+    // For FaselHD: navigate the worker tab (same CF session, no new Turnstile)
     if (isFaselUrl(url)) {
       try {
-        const page = await ensureWorkerPage();
-        console.log(`[Browser] In-page fetch: ${url.substring(0, 80)}...`);
-
-        const result = await page.evaluate(async (fetchUrl) => {
-          try {
-            const r = await fetch(fetchUrl, { credentials: "include" });
-            return { ok: r.ok, status: r.status, finalUrl: r.url, html: r.ok ? await r.text() : null };
-          } catch (e) {
-            return { ok: false, status: 0, finalUrl: "", html: null };
-          }
-        }, url).catch(() => ({ ok: false, status: 0, finalUrl: "", html: null }));
-
-        if (result.html && result.html.length > 500 && !result.html.includes("Just a moment")) {
-          console.log(`[Browser] OK (${result.html.length} chars)`);
-
-          // Detect domain rotation via final URL
-          if (result.finalUrl && isFaselUrl(url) && !isFaselUrl(result.finalUrl)) {
-            console.log(`[Browser] Domain rotated! → ${result.finalUrl}`);
-            markDomainBad();
-            return null;
-          }
-
-          return result.html;
-        }
-
-        console.log(`[Browser] In-page fetch failed (status=${result.status}), trying direct nav...`);
+        const html = await workerNavigate(url, timeout);
+        if (html) return html;
+        console.log("[Browser] Worker failed, trying fresh tab...");
       } catch (err) {
-        console.log(`[Browser] Worker error: ${err.message}, trying direct nav...`);
+        console.log(`[Browser] Worker error: ${err.message}, trying fresh tab...`);
         workerPage = null;
         workerDomain = null;
       }
     }
 
-    // Fallback: direct page navigation (non-FaselHD or if worker failed)
+    // Fallback: fresh tab (non-FaselHD or if worker failed)
     const browser = await getBrowser();
     const page = await browser.newPage();
     try {
@@ -246,20 +263,18 @@ async function browserFetch(url, timeout = 30000) {
 
       const content = await page.content();
       if (content.includes("Just a moment") || content.includes("Checking your browser")) {
-        console.log("[Browser] CF challenge detected, waiting...");
+        console.log("[Browser] CF challenge, waiting...");
         try {
           await new Promise(r => setTimeout(r, 2000));
           for (const frame of page.frames()) {
             const box = await frame.$('input[type="checkbox"], .cb-lb');
             if (box) { await box.click(); break; }
           }
-        } catch (e) {
-          console.log("[Browser] Turnstile click attempt:", e.message);
-        }
+        } catch {}
         await page.waitForFunction(
           () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
           { timeout: 20000 }
-        ).catch(() => console.log("[Browser] CF challenge did not resolve"));
+        ).catch(() => console.log("[Browser] CF did not resolve"));
       }
 
       const html = await page.content();
