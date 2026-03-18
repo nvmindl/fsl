@@ -1114,15 +1114,18 @@ const server = http.createServer(async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Global request timeout: 120s max per request
+  // Global request timeout: 90s max per request
   const requestTimeout = setTimeout(() => {
-    if (!res.writableEnded) {
+    if (!res.headersSent && !res.writableEnded) {
       console.log(`[TIMEOUT] Request timed out: ${req.url}`);
-      res.writeHead(504, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Request timed out" }));
+      try {
+        res.writeHead(504, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request timed out" }));
+      } catch {}
     }
-  }, 120000);
+  }, 90000);
   res.on("finish", () => clearTimeout(requestTimeout));
+  res.on("close", () => clearTimeout(requestTimeout));
   // ── M3U8/segment proxy (bypasses IP-locked streams) ──
   // Supports both: /proxy/{base64url}/stream.m3u8 and /proxy?url={base64url}
   if (req.url.startsWith("/proxy")) {
@@ -1249,10 +1252,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Stremio SDK router
+  // Stremio SDK router — guard against double-response from timeout
+  if (res.headersSent || res.writableEnded) return;
   router(req, res, () => {
-    res.writeHead(404);
-    res.end(JSON.stringify({ error: "Not Found" }));
+    if (!res.headersSent) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: "Not Found" }));
+    }
   });
 });
 
