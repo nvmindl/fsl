@@ -14,6 +14,8 @@ function resetBrowserIdle() {
   browserIdleTimer = setTimeout(async () => {
     if (browserInstance && browserInstance.isConnected()) {
       console.log("[Browser] Idle timeout, closing to free memory");
+      workerPage = null;
+      workerDomain = null;
       try { await browserInstance.close(); } catch {}
       browserInstance = null;
     }
@@ -61,6 +63,8 @@ async function getBrowser() {
       browserInstance.on("disconnected", () => {
         console.log("[Browser] Disconnected");
         browserInstance = null;
+        workerPage = null;
+        workerDomain = null;
         if (browserIdleTimer) clearTimeout(browserIdleTimer);
       });
 
@@ -142,70 +146,142 @@ async function fastFetch(url) {
   }
 }
 
-// Fetch a page using Puppeteer (bypasses CF)
+// ── Worker page: persistent browser tab for FaselHD content ──
+// CF challenges full page navigations with Turnstile (can't auto-solve).
+// But CF does NOT challenge same-origin fetch() from within an already-loaded page.
+// So: load homepage once → use in-page fetch() for all content pages.
+let workerPage = null;
+let workerDomain = null;
+
+async function ensureWorkerPage() {
+  const browser = await getBrowser();
+  const domain = activeDomain || MAIN_DOMAIN;
+
+  if (workerPage && !workerPage.isClosed() && workerDomain === domain) {
+    return workerPage;
+  }
+
+  if (workerPage && !workerPage.isClosed()) {
+    await workerPage.close().catch(() => {});
+  }
+
+  console.log(`[Worker] Opening session on ${domain}...`);
+  workerPage = await browser.newPage();
+  await workerPage.setUserAgent(UA);
+  await workerPage.setViewport({ width: 1280, height: 720 });
+
+  await workerPage.goto(domain + "/", { waitUntil: "domcontentloaded", timeout: 25000 });
+
+  // Handle CF challenge on homepage (lightweight, solvable)
+  const content = await workerPage.content();
+  if (content.includes("Just a moment") || content.includes("Checking your browser")) {
+    console.log("[Worker] CF challenge on homepage...");
+    try {
+      await new Promise(r => setTimeout(r, 2000));
+      for (const frame of workerPage.frames()) {
+        const box = await frame.$('input[type="checkbox"], .cb-lb');
+        if (box) { await box.click(); break; }
+      }
+    } catch {}
+    await workerPage.waitForFunction(
+      () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+      { timeout: 20000 }
+    ).catch(() => console.log("[Worker] CF did not resolve"));
+  }
+
+  workerDomain = domain;
+  await extractCfCookies(workerPage);
+  console.log("[Worker] Session ready");
+  return workerPage;
+}
+
+// Fetch a page using Puppeteer
 async function browserFetch(url, timeout = 30000) {
   return withBrowserLock(async () => {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  try {
-    await page.setUserAgent(UA);
-    await page.setViewport({ width: 1280, height: 720 });
-
-    console.log(`[Browser] Navigating: ${url}`);
-    const response = await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout,
-    });
-
-    // Check for CF challenge
-    const content = await page.content();
-    if (content.includes("Just a moment") || content.includes("Checking your browser")) {
-      console.log("[Browser] CF challenge detected, waiting...");
-
-      // Try to click the Turnstile checkbox
+    // For FaselHD: use worker page with in-page fetch (bypasses per-page CF Turnstile)
+    if (isFaselUrl(url)) {
       try {
-        await new Promise(r => setTimeout(r, 2000));
-        const frames = page.frames();
-        for (const frame of frames) {
-          const turnstileBox = await frame.$('input[type="checkbox"], .cb-lb');
-          if (turnstileBox) {
-            console.log("[Browser] Clicking Turnstile checkbox...");
-            await turnstileBox.click();
-            break;
+        const page = await ensureWorkerPage();
+        console.log(`[Browser] In-page fetch: ${url.substring(0, 80)}...`);
+
+        const result = await page.evaluate(async (fetchUrl) => {
+          try {
+            const r = await fetch(fetchUrl, { credentials: "include" });
+            return { ok: r.ok, status: r.status, finalUrl: r.url, html: r.ok ? await r.text() : null };
+          } catch (e) {
+            return { ok: false, status: 0, finalUrl: "", html: null };
           }
+        }, url).catch(() => ({ ok: false, status: 0, finalUrl: "", html: null }));
+
+        if (result.html && result.html.length > 500 && !result.html.includes("Just a moment")) {
+          console.log(`[Browser] OK (${result.html.length} chars)`);
+
+          // Detect domain rotation via final URL
+          if (result.finalUrl && isFaselUrl(url) && !isFaselUrl(result.finalUrl)) {
+            console.log(`[Browser] Domain rotated! → ${result.finalUrl}`);
+            markDomainBad();
+            return null;
+          }
+
+          return result.html;
         }
-      } catch (e) {
-        console.log("[Browser] Turnstile click attempt:", e.message);
+
+        console.log(`[Browser] In-page fetch failed (status=${result.status}), trying direct nav...`);
+      } catch (err) {
+        console.log(`[Browser] Worker error: ${err.message}, trying direct nav...`);
+        workerPage = null;
+        workerDomain = null;
+      }
+    }
+
+    // Fallback: direct page navigation (non-FaselHD or if worker failed)
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    try {
+      await page.setUserAgent(UA);
+      await page.setViewport({ width: 1280, height: 720 });
+
+      console.log(`[Browser] Direct navigation: ${url}`);
+      const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+
+      const content = await page.content();
+      if (content.includes("Just a moment") || content.includes("Checking your browser")) {
+        console.log("[Browser] CF challenge detected, waiting...");
+        try {
+          await new Promise(r => setTimeout(r, 2000));
+          for (const frame of page.frames()) {
+            const box = await frame.$('input[type="checkbox"], .cb-lb');
+            if (box) { await box.click(); break; }
+          }
+        } catch (e) {
+          console.log("[Browser] Turnstile click attempt:", e.message);
+        }
+        await page.waitForFunction(
+          () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+          { timeout: 20000 }
+        ).catch(() => console.log("[Browser] CF challenge did not resolve"));
       }
 
-      await page.waitForFunction(
-        () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
-        { timeout: 20000 }
-      ).catch(() => console.log("[Browser] CF challenge did not resolve in time"));
-    }
+      const html = await page.content();
+      const finalUrl = page.url();
+      const status = response ? response.status() : 0;
+      console.log(`[Browser] ${url.substring(0, 60)}... → ${status} (${html.length} chars)`);
 
-    const html = await page.content();
-    const finalUrl = page.url();
-    const status = response ? response.status() : 0;
-    console.log(`[Browser] ${url.substring(0, 60)}... → ${status} (${html.length} chars)`);
+      await extractCfCookies(page);
 
-    // Extract CF cookies for reuse by fast HTTP fetch
-    await extractCfCookies(page);
+      if (isFaselUrl(url) && !isFaselUrl(finalUrl)) {
+        console.log(`[Browser] Domain rotated! ${url} → ${finalUrl}`);
+        markDomainBad();
+        return null;
+      }
 
-    // Detect domain rotation
-    if (isFaselUrl(url) && !isFaselUrl(finalUrl)) {
-      console.log(`[Browser] Domain rotated! ${url} → ${finalUrl}`);
-      markDomainBad();
+      return html;
+    } catch (err) {
+      console.error(`[Browser] Error: ${err.message}`);
       return null;
+    } finally {
+      await page.close().catch(() => {});
     }
-
-    return html;
-  } catch (err) {
-    console.error(`[Browser] Error: ${err.message}`);
-    return null;
-  } finally {
-    await page.close().catch(() => {});
-  }
   }); // end withBrowserLock
 }
 
@@ -315,6 +391,9 @@ async function discoverDomain() {
     console.log(`[Domain] Puppeteer discovery failed: ${e.message}`);
   }
 
+  // After discovery, pre-warm worker page for content fetches
+  try { await ensureWorkerPage(); } catch {}
+
   // FALLBACK: Quick parallel scan of nearby numbers
   console.log("[Domain] Puppeteer failed, scanning...");
   const numMatch = activeDomain.match(/web(\d+)x/);
@@ -368,6 +447,7 @@ async function getDomain() {
 function markDomainBad() {
   console.log(`[Domain] Marking ${activeDomain} as bad`);
   domainLastCheck = 0;
+  workerDomain = null; // force worker page recreation on new domain
 }
 
 // ── HTTP ──
