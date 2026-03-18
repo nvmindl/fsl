@@ -112,7 +112,7 @@ async function browserFetch(url, timeout = 45000) {
     console.log(`[Browser] ${url.substring(0, 60)}... → ${status} (${html.length} chars)`);
 
     // Detect domain rotation: if we were redirected to a different domain
-    if (url.includes(DOMAIN_BASE) && !finalUrl.includes(DOMAIN_BASE)) {
+    if (isFaselUrl(url) && !isFaselUrl(finalUrl)) {
       console.log(`[Browser] Domain rotated! ${url} → ${finalUrl}`);
       markDomainBad();
       return null;
@@ -154,83 +154,108 @@ function cacheSet(store, key, data) {
 
 // ── FaselHD Domain Rotation ──
 const DOMAIN_BASE = "faselhdx";
-const FALLBACK_DOMAINS = ["https://www.fasel-hd.cam", "https://www.faselhd.club"];
-let activeDomain = process.env.FASELHDX_DOMAIN || "https://web31718x.faselhdx.best";
-let domainLastCheck = Date.now(); // Trust configured domain on startup
-const DOMAIN_TTL = 15 * 60 * 1000;
+const MAIN_DOMAIN = "https://www.fasel-hd.cam";
+function isFaselUrl(url) { return url.includes(DOMAIN_BASE) || url.includes("fasel-hd.cam") || url.includes("faselhd."); }
+let activeDomain = process.env.FASELHDX_DOMAIN || MAIN_DOMAIN;
+let domainLastCheck = 0; // Force discovery on first request
+const DOMAIN_TTL = 10 * 60 * 1000; // 10 min
 let domainDiscoveryPromise = null;
 
 async function discoverDomain() {
-  // Try last known domain first
-  if (await testDomain(activeDomain)) {
-    domainLastCheck = Date.now();
-    return activeDomain;
-  }
-
-  console.log("[Domain] Active domain down, discovering via redirect...");
-
-  // PRIMARY METHOD: Follow fasel-hd.cam redirect to find active webXx subdomain
-  // fasel-hd.cam/wp-admin/admin-ajax.php redirects to the active subdomain
-  for (const fallback of FALLBACK_DOMAINS) {
+  // If we have a webXx domain, check if it's still alive
+  if (activeDomain !== MAIN_DOMAIN && activeDomain.includes(DOMAIN_BASE)) {
     try {
-      const resp = await fetch(`${fallback}/wp-admin/admin-ajax.php`, {
-        headers: HEADERS,
+      const resp = await fetch(`${activeDomain}/`, {
         redirect: "manual",
-        signal: AbortSignal.timeout(6000),
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(5000),
       });
-      const loc = resp.headers.get("location") || "";
-      const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-      if (m) {
-        const candidate = m[0].replace(/^http:/, "https:");
-        if (await testDomain(candidate)) {
-          activeDomain = candidate;
-          domainLastCheck = Date.now();
-          console.log(`[Domain] Discovered via redirect: ${activeDomain}`);
-          return activeDomain;
-        }
+      if (resp.status === 200) {
+        console.log(`[Domain] Current domain still alive: ${activeDomain}`);
+        domainLastCheck = Date.now();
+        return activeDomain;
       }
-    } catch (e) {
-      console.log(`[Domain] Redirect probe failed for ${fallback}: ${e.message}`);
-    }
+    } catch {}
   }
 
-  // FALLBACK: Scan nearby numbers from last known — all in parallel for speed
-  console.log("[Domain] Redirect method failed, scanning...");
+  console.log("[Domain] Discovering active domain via Puppeteer...");
+
+  // Use Puppeteer to visit fasel-hd.cam — it goes through CF and lands on active domain
+  try {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    try {
+      await page.setUserAgent(UA);
+      await page.goto(MAIN_DOMAIN, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+      // Wait for CF challenge if present
+      const content = await page.content();
+      if (content.includes("Just a moment") || content.includes("Checking your browser")) {
+        console.log("[Domain] CF challenge, waiting...");
+        await page.waitForFunction(
+          () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+          { timeout: 20000 }
+        ).catch(() => {});
+      }
+
+      const finalUrl = page.url();
+      console.log(`[Domain] Browser landed on: ${finalUrl}`);
+
+      // Extract the domain from the final URL
+      const m = finalUrl.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+      if (m) {
+        activeDomain = m[0].replace(/^http:/, "https:");
+        domainLastCheck = Date.now();
+        console.log(`[Domain] Discovered: ${activeDomain}`);
+        return activeDomain;
+      }
+
+      // Maybe it stayed on fasel-hd.cam — check if page links contain webXx
+      const html = await page.content();
+      const linkMatch = html.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+      if (linkMatch) {
+        activeDomain = linkMatch[0].replace(/^http:/, "https:");
+        domainLastCheck = Date.now();
+        console.log(`[Domain] Discovered from page links: ${activeDomain}`);
+        return activeDomain;
+      }
+
+      // Site might now run directly on fasel-hd.cam
+      if (finalUrl.includes("fasel-hd.cam") && html.length > 5000 && !html.includes("Just a moment")) {
+        activeDomain = MAIN_DOMAIN;
+        domainLastCheck = Date.now();
+        console.log(`[Domain] Site running directly on ${MAIN_DOMAIN}`);
+        return activeDomain;
+      }
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } catch (e) {
+    console.log(`[Domain] Puppeteer discovery failed: ${e.message}`);
+  }
+
+  // FALLBACK: Quick parallel scan of nearby numbers
+  console.log("[Domain] Puppeteer failed, scanning...");
   const numMatch = activeDomain.match(/web(\d+)x/);
   const lastNum = numMatch ? parseInt(numMatch[1]) : 31718;
 
-  // Build all candidates at once
   const candidates = [];
-  for (let offset = -5; offset <= 100; offset++) {
+  for (let offset = -10; offset <= 200; offset++) {
     for (const tld of ['best', 'xyz']) {
       candidates.push(`https://web${lastNum + offset}x.${DOMAIN_BASE}.${tld}`);
     }
   }
-  console.log(`[Domain] Scanning ${candidates.length} candidates from web${lastNum - 5}x to web${lastNum + 100}x...`);
+  console.log(`[Domain] Scanning ${candidates.length} candidates...`);
 
-  // Test all in parallel with short timeout
   const scanResults = await Promise.all(
     candidates.map(async (domain) => {
       try {
-        const resp = await fetch(`${domain}/feed`, {
-          headers: { "User-Agent": UA },
+        const resp = await fetch(`${domain}/`, {
           redirect: "manual",
-          signal: AbortSignal.timeout(4000),
+          headers: { "User-Agent": UA },
+          signal: AbortSignal.timeout(3000),
         });
-        if (resp.status >= 300 && resp.status < 400) {
-          const loc = resp.headers.get("location") || "";
-          if (!loc.startsWith(domain)) return null; // rotated away
-          const resp2 = await fetch(loc, { headers: { "User-Agent": UA }, redirect: "manual", signal: AbortSignal.timeout(4000) });
-          if (resp2.ok) {
-            const text = await resp2.text();
-            if (text.includes("<channel") || text.includes("<rss")) return domain;
-          }
-          return null;
-        }
-        if (resp.ok) {
-          const text = await resp.text();
-          if (text.includes("<channel") || text.includes("<rss")) return domain;
-        }
+        if (resp.status === 200) return domain;
       } catch {}
       return null;
     })
@@ -244,48 +269,13 @@ async function discoverDomain() {
     return activeDomain;
   }
 
-  console.log("[Domain] Could not discover active domain, using last known");
+  console.log("[Domain] Could not discover, using last known");
   domainLastCheck = Date.now();
   return activeDomain;
 }
 
-async function testDomain(domain) {
-  try {
-    // Use redirect:'manual' to detect 301 (domain moved)
-    const resp = await fetch(`${domain}/feed`, {
-      headers: { "User-Agent": UA },
-      redirect: "manual",
-      signal: AbortSignal.timeout(8000),
-    });
-    // 301 to a different domain means domain rotated away
-    if (resp.status >= 300 && resp.status < 400) {
-      const loc = resp.headers.get("location") || "";
-      // Self-redirect (e.g. /feed/ → /feed) is OK — follow it
-      if (loc.startsWith(domain)) {
-        const resp2 = await fetch(loc, {
-          headers: { "User-Agent": UA },
-          redirect: "manual",
-          signal: AbortSignal.timeout(5000),
-        });
-        if (resp2.ok) {
-          const text = await resp2.text();
-          return text.includes("<channel") || text.includes("<rss");
-        }
-      }
-      return false;
-    }
-    if (resp.ok) {
-      const text = await resp.text();
-      // RSS feed should contain channel/rss tags
-      if (text.includes("<channel") || text.includes("<rss")) return true;
-    }
-  } catch {}
-  return false;
-}
-
 async function getDomain() {
   if (Date.now() - domainLastCheck > DOMAIN_TTL) {
-    // Dedup concurrent discovery calls
     if (!domainDiscoveryPromise) {
       domainDiscoveryPromise = discoverDomain().finally(() => { domainDiscoveryPromise = null; });
     }
@@ -325,7 +315,7 @@ async function fetchPage(url, retries = 2) {
 
       // Use Puppeteer for FaselHD pages, native fetch for others
       let html;
-      if (url.includes(DOMAIN_BASE)) {
+      if (isFaselUrl(url)) {
         // Quick check: is the domain still alive? (native fetch, no browser needed)
         try {
           const checkResp = await fetch(url, {
@@ -334,11 +324,17 @@ async function fetchPage(url, retries = 2) {
             signal: AbortSignal.timeout(5000),
           });
           if (checkResp.status >= 300 && checkResp.status < 400) {
-            console.log(`[Fetch] Domain returned ${checkResp.status}, rotating...`);
-            markDomainBad();
-            const newDomain = await getDomain();
-            url = url.replace(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/, newDomain);
-            console.log(`[Fetch] Retrying with new domain: ${url}`);
+            const loc = checkResp.headers.get("location") || "";
+            // Only rotate if redirect goes to a different base domain
+            const urlHost = new URL(url).hostname;
+            const locHost = loc ? new URL(loc).hostname : "";
+            if (locHost && locHost !== urlHost) {
+              console.log(`[Fetch] Domain returned ${checkResp.status} → ${loc}, rotating...`);
+              markDomainBad();
+              const newDomain = await getDomain();
+              url = url.replace(/https?:\/\/[^/]+/, newDomain);
+              console.log(`[Fetch] Retrying with new domain: ${url}`);
+            }
           }
         } catch {}
         html = await browserFetch(url);
@@ -489,7 +485,7 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   const currentDomain = await getDomain();
   return allResults.map(r => ({
     ...r,
-    url: r.url.replace(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/, currentDomain)
+    url: r.url.replace(/https?:\/\/[^/]+/, currentDomain)
   }));
 }
 
@@ -1064,7 +1060,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Only allow proxying to known CDN domains
-    const allowed = ['scdns.io', 'faselhdx.best', 'faselhdx.xyz'];
+    const allowed = ['scdns.io', 'faselhdx.best', 'faselhdx.xyz', 'fasel-hd.cam', 'faselhd.club'];
     let hostname;
     try { hostname = new URL(targetUrl).hostname; } catch { hostname = ''; }
     if (!allowed.some(d => hostname.endsWith(d))) {
@@ -1153,26 +1149,6 @@ const server = http.createServer(async (req, res) => {
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(info, null, 2));
-    return;
-  }
-
-  // Debug search endpoint
-  if (req.url.startsWith("/debug/search?")) {
-    const p = new URL(req.url, `http://localhost:${PORT}`);
-    const q = p.searchParams.get("q") || "";
-    const type = p.searchParams.get("type") || "movie";
-    const year = parseInt(p.searchParams.get("year")) || 0;
-    try {
-      const domain = await getDomain();
-      const slug = slugify(q);
-      const sitemapResults = await searchSitemaps(domain, type === "movie" ? "movies" : "seasons", type === "movie" ? 14 : 4, slug, year);
-      const rssResults = await searchViaRSS(q, domain);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ domain, slug, sitemapResults, rssResults }, null, 2));
-    } catch (e) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
-    }
     return;
   }
 
