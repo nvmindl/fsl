@@ -101,12 +101,12 @@ const CF_COOKIE_TTL = 8 * 60 * 1000; // CF cookies last ~15min, refresh at 8min
 async function extractCfCookies(page) {
   try {
     const cookies = await page.cookies();
-    const relevant = cookies.filter(c => c.name.startsWith("cf_") || c.name.startsWith("__cf"));
-    if (relevant.length > 0) {
+    if (cookies.length > 0) {
       cfCookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
       cfCookiesDomain = new URL(page.url()).hostname;
       cfCookiesTs = Date.now();
-      console.log(`[CF] Cached ${relevant.length} CF cookie(s) for ${cfCookiesDomain}`);
+      const cfCount = cookies.filter(c => c.name.startsWith("cf_") || c.name.startsWith("__cf")).length;
+      console.log(`[CF] Cached ${cookies.length} cookie(s) (${cfCount} CF) for ${cfCookiesDomain}`);
     }
   } catch {}
 }
@@ -232,6 +232,9 @@ async function workerNavigate(url, timeout = 20000) {
     return null;
   }
 
+  // Refresh cookies after every successful navigation so fastFetch works for subsequent pages
+  await extractCfCookies(page);
+
   return html;
 }
 
@@ -305,6 +308,7 @@ const cache = {
   imdb: new Map(),    // imdbId → { title, year, ts }
   search: new Map(),  // "query|year" → { results, ts }
   stream: new Map(),  // imdbId:s:e → { streams, ts }
+  page: new Map(),    // url → { html, ts } — short-lived, avoids re-fetching same URL
 };
 const IMDB_TTL = 24 * 60 * 60 * 1000;   // 24h
 const SEARCH_TTL = 60 * 60 * 1000;        // 1h (sitemap-based, stable results)
@@ -485,6 +489,13 @@ const HEADERS = {
 };
 
 async function fetchPage(url, retries = 2) {
+  // Short-lived page cache — avoids re-fetching same URL within 2 min
+  const pageCached = cacheGet(cache.page, url, 120000);
+  if (pageCached) {
+    console.log(`[Fetch] Page cache hit (${pageCached.length} chars)`);
+    return pageCached;
+  }
+
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
@@ -537,6 +548,7 @@ async function fetchPage(url, retries = 2) {
         continue;
       }
 
+      cacheSet(cache.page, url, html);
       return html;
     } catch (err) {
       console.error(`[Fetch] ${err.message}`);
@@ -1089,31 +1101,38 @@ async function resolve(imdbId, type, season, episode) {
     // Parse the first result's page for season/episode info
     let { seasons, episodes } = await parseSeriesPage(targetUrl);
 
-    // If seasons exist and we need a different one, navigate there
-    if (seasons.length > 0) {
+    // Only navigate to season page if we need a DIFFERENT season (season 1 is usually default)
+    if (seasons.length > 0 && episodes.length === 0) {
+      // No episodes on current page — need to navigate to season
       const match = seasons.find((s) => s.num === sn);
       if (match) {
         console.log(`[Resolve] Season ${sn}: ${match.url}`);
-        // If not already on the right season, fetch that page
-        const isActive = seasons.findIndex((s) => s.num === sn);
-        // Re-parse the correct season page for its episodes
         const seasonPage = await parseSeriesPage(match.url);
         episodes = seasonPage.episodes;
       } else {
-        console.log(
-          `[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`
-        );
+        console.log(`[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`);
+      }
+    } else if (seasons.length > 1) {
+      // Episodes shown but check if we're on the right season
+      const match = seasons.find((s) => s.num === sn);
+      if (match) {
+        // Check if the current page is already for this season
+        const activeMatch = seasons.find((s) => s.num === sn);
+        // Only re-fetch if a different season URL
+        if (activeMatch && activeMatch.url !== targetUrl) {
+          console.log(`[Resolve] Season ${sn}: ${activeMatch.url}`);
+          const seasonPage = await parseSeriesPage(activeMatch.url);
+          if (seasonPage.episodes.length > 0) episodes = seasonPage.episodes;
+        }
       }
     }
 
     // Find the specific episode
     let epUrl = null;
-    // Match by episode number
     const epMatch = episodes.find((e) => e.num === ep);
     if (epMatch) {
       epUrl = epMatch.url;
     } else if (episodes.length >= ep) {
-      // Fallback: use index
       epUrl = episodes[ep - 1]?.url;
     }
 
@@ -1121,9 +1140,7 @@ async function resolve(imdbId, type, season, episode) {
       console.log(`[Resolve] Episode ${ep}: ${epUrl}`);
       targetUrl = epUrl;
     } else {
-      console.log(
-        `[Resolve] Episode ${ep} not found (${episodes.length} episodes available)`
-      );
+      console.log(`[Resolve] Episode ${ep} not found (${episodes.length} episodes available)`);
     }
   }
 
