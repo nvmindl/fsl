@@ -8,3 +8,5 @@ services:
         value: "8080"
       - key: PUBLIC_URL
         value: "https://faselhdx.onrender.com"
+      - key: FASELHDX_DOMAIN
+        value: "web31912x.faselhdx.best"
