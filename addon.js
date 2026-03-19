@@ -517,25 +517,24 @@ async function fetchPage(url, retries = 2) {
         html = await fastFetch(url);
         if (html) {
           console.log(`[Fetch] Fast fetch OK (${html.length} chars)`);
+          cacheSet(cache.page, url, html);
           return html;
         }
 
-        // Quick redirect check before launching browser
+        // Try plain HTTP with redirect following (works on non-CF subdomains)
         try {
-          const checkResp = await fetch(url, {
-            redirect: "manual",
-            headers: { "User-Agent": UA },
-            signal: AbortSignal.timeout(4000),
+          const resp = await fetch(url, {
+            headers: { ...HEADERS, Referer: url },
+            redirect: "follow",
+            signal: AbortSignal.timeout(12000),
           });
-          if (checkResp.status >= 300 && checkResp.status < 400) {
-            const loc = checkResp.headers.get("location") || "";
-            const urlHost = new URL(url).hostname;
-            const locHost = loc ? new URL(loc).hostname : "";
-            if (locHost && locHost !== urlHost) {
-              console.log(`[Fetch] Domain rotated ${checkResp.status} → ${loc}`);
-              markDomainBad();
-              const newDomain = await getDomain();
-              url = url.replace(/https?:\/\/[^/]+/, newDomain);
+          if (resp.ok) {
+            learnDomainFromUrl(resp.url);
+            const text = await resp.text();
+            if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
+              console.log(`[Fetch] HTTP follow-redirect OK (${text.length} chars)`);
+              cacheSet(cache.page, url, text);
+              return text;
             }
           }
         } catch {}
