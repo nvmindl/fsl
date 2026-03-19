@@ -1,5 +1,6 @@
 const { addonBuilder } = require("stremio-addon-sdk");
 const cheerio = require("cheerio");
+const vm = require("vm");
 require("dotenv").config();
 
 // ── Puppeteer Browser (CF bypass) — auto-close after idle to save memory ──
@@ -330,8 +331,8 @@ function cacheSet(store, key, data) {
 const DOMAIN_BASE = "faselhdx";
 const MAIN_DOMAIN = "https://www.fasel-hd.cam";
 function isFaselUrl(url) { return url.includes(DOMAIN_BASE) || url.includes("fasel-hd.cam") || url.includes("faselhd."); }
-let activeDomain = MAIN_DOMAIN;
-let domainLastCheck = 0; // Force discovery on first request
+let activeDomain = process.env.FASELHDX_DOMAIN ? `https://${process.env.FASELHDX_DOMAIN.replace(/^https?:\/\//, "")}` : MAIN_DOMAIN;
+let domainLastCheck = process.env.FASELHDX_DOMAIN ? Date.now() : 0; // Skip discovery if domain provided
 const DOMAIN_TTL = 10 * 60 * 1000; // 10 min
 let domainDiscoveryPromise = null;
 
@@ -580,7 +581,8 @@ async function getImdbInfo(imdbId) {
     if (!resp.ok) return null;
     const data = await resp.json();
     if (data.d && data.d.length > 0) {
-      const info = { title: data.d[0].l, year: data.d[0].y };
+      const match = data.d.find(e => e.id === imdbId) || data.d[0];
+      const info = { title: match.l, year: match.y };
       cacheSet(cache.imdb, imdbId, info);
       return info;
     }
@@ -820,7 +822,7 @@ async function getPlayerTokens(url) {
   // Extract quality badge from page
   const $ = cheerio.load(html);
   let qualityBadge = $(".quality, .مشاهدة").first().text().trim() ||
-    (html.match(/(?:quality|الجودة)[^<]*?([0-9]{3,4}p[^<]{0,20})/i) || [])[1] || "";
+    (html.match(/(?:quality|الجودة)[^<]*?([0-9]{3,4}p(?:\s*[A-Za-z-]+)?)/i) || [])[1] || "";
   // Strip any residual HTML tags/attributes
   qualityBadge = qualityBadge.replace(/<[^>]*>/g, "").replace(/"[^"]*"/g, "").trim();
 
@@ -936,7 +938,8 @@ async function parseSeriesPage(url) {
 
 // ── Stream extraction from video_player page ──
 // The player page has obfuscated JS that constructs m3u8 URLs.
-// We execute it with mocked browser globals to capture the JWPlayer config.
+// We execute it in a VM sandbox with mocked browser globals to capture the JWPlayer config.
+// The obfuscated script checks localStorage for a consent key before calling jwplayer().setup().
 
 async function extractStreamFromPlayer(playerUrl) {
   const html = await fetchPage(playerUrl);
@@ -959,122 +962,137 @@ async function extractStreamFromPlayer(playerUrl) {
   }
   console.log(`[Extract] Found player script (${mainScript.length} chars)`);
 
-  // Execute with mocked globals to capture JWPlayer setup config
-  let capturedConfig = null;
-  const me = () => ({
-    style: { display: "", backgroundImage: "" },
-    innerHTML: "", textContent: "", src: "",
-    setAttribute() {}, getAttribute() { return null; },
-    appendChild() {}, removeChild() {},
-    querySelector() { return null; }, querySelectorAll() { return []; },
-    classList: { add() {}, remove() {}, contains() { return false; } },
-    offsetWidth: 1920, offsetHeight: 1080, clientWidth: 1920,
-    addEventListener(ev, fn) {
-      if (ev === "click") {
-        process.nextTick(() => { try { fn({ isTrusted: true }); } catch(e) {} });
+  // Minimal DOM element mock
+  const me = () => {
+    const el = {
+      style: new Proxy({}, { get() { return ""; }, set() { return true; } }),
+      innerHTML: "", textContent: "", src: "", id: "", href: "", className: "", type: "",
+      setAttribute() {}, getAttribute() { return ""; },
+      appendChild() { return el; }, removeChild() { return el; }, insertBefore() { return el; },
+      querySelector() { return me(); }, querySelectorAll() { return []; },
+      getElementsByTagName() { return []; }, getElementsByClassName() { return []; },
+      classList: { add() {}, remove() {}, contains() { return false; }, toggle() {} },
+      addEventListener() {}, removeEventListener() {},
+      dataset: new Proxy({}, { get() { return ""; }, set() { return true; } }),
+      tagName: "DIV", nodeName: "DIV",
+      offsetWidth: 1920, offsetHeight: 1080, clientWidth: 1920, clientHeight: 1080,
+      parentNode: null, parentElement: null,
+      childNodes: [], children: [], firstChild: null, lastChild: null,
+      nextSibling: null, previousSibling: null,
+      cloneNode() { return me(); }, dispatchEvent() { return true; },
+      getBoundingClientRect() { return { top: 0, left: 0, bottom: 1080, right: 1920, width: 1920, height: 1080 }; },
+      scrollIntoView() {}, focus() {}, blur() {}, click() {}, remove() {},
+    };
+    el.parentNode = el;
+    el.parentElement = el;
+    return el;
+  };
+
+  // jQuery proxy — returns a chainable stub for any method call
+  const jqProxy = new Proxy(function() {}, {
+    apply(target, thisArg, args) {
+      if (typeof args[0] === "function") { try { args[0](); } catch(e) {} }
+      return new Proxy({ length: 0, 0: me() }, {
+        get(t, p) {
+          if (p === "length") return 0;
+          if (p === Symbol.toPrimitive || p === "then") return undefined;
+          return function() { return t; };
+        },
+      });
+    },
+    get(target, prop) {
+      if (prop === "ajax" || prop === "get" || prop === "post" || prop === "getJSON") {
+        return function() { return { done() { return this; }, fail() { return this; }, always() { return this; } }; };
       }
+      return target[prop];
     },
   });
 
-  // Save & set globals
-  const saved = {};
-  const mockGlobals = {
-    document: {
-      getElementById() { return me(); },
-      querySelector() { return me(); },
-      querySelectorAll() { return []; },
-      createElement() { return me(); },
-      body: { appendChild() {}, style: {} },
-      head: { appendChild() {} },
-      cookie: "", addEventListener() {},
-      documentElement: { style: {} },
-      readyState: "complete",
-      currentScript: { dataset: {} },
+  // JWPlayer mock — capture any config object passed to any method
+  let capturedConfig = null;
+  const playerProxy = () => new Proxy({}, {
+    get(t, p) {
+      if (p === "then" || p === Symbol.toPrimitive) return undefined;
+      return function(...args) {
+        if (args[0] && typeof args[0] === "object") capturedConfig = args[0];
+        return playerProxy();
+      };
     },
-    localStorage: {
-      getItem(key) {
-        if (key && typeof key === "string" && key.includes("qiey9zrCKg")) return "1";
-        return null;
-      },
-      setItem() {}, removeItem() {}, clear() {},
-    },
-    sessionStorage: { getItem() { return null; }, setItem() {}, removeItem() {}, clear() {} },
-    navigator: { userAgent: UA },
-    location: { href: playerUrl, hostname: new URL(playerUrl).hostname, origin: new URL(playerUrl).origin, protocol: "https:", pathname: "/video_player" },
-    performance: { now() { return Date.now(); } },
-    window: global,
+  });
+  const mockJw = Object.assign(function() { return playerProxy(); }, { key: null, version: "8.33.2" });
+
+  const parsedUrl = new URL(playerUrl);
+  const sandbox = {
+    // JS built-ins
+    console: { log() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {}, dir() {}, table() {} },
+    parseInt, parseFloat, isNaN, isFinite, undefined,
+    encodeURIComponent, decodeURIComponent, encodeURI, decodeURI, escape, unescape,
+    JSON, Math, Date, RegExp, Array, Object, String, Number, Boolean,
+    Error, TypeError, RangeError, SyntaxError, ReferenceError, URIError, EvalError,
+    Map, Set, WeakMap, WeakSet, Promise, Symbol, Proxy, Reflect,
+    ArrayBuffer, Uint8Array, Int8Array, Uint16Array, Int16Array, Uint32Array, Int32Array,
+    Float32Array, Float64Array, DataView,
+    TextEncoder, TextDecoder, URL, URLSearchParams,
+    Infinity, NaN,
+
+    setTimeout: (fn, ms) => setTimeout(() => { try { fn(); } catch(e) {} }, Math.min(ms || 0, 500)),
+    clearTimeout, setInterval: () => 0, clearInterval,
     atob: (s) => Buffer.from(s, "base64").toString("binary"),
     btoa: (s) => Buffer.from(s, "binary").toString("base64"),
-    XMLHttpRequest: function() {
-      this.open = function() {};
-      this.send = function() {};
-      this.setRequestHeader = function() {};
+
+    document: {
+      getElementById() { return me(); }, querySelector() { return me(); }, querySelectorAll() { return []; },
+      createElement(tag) { const e = me(); e.tagName = (tag || "DIV").toUpperCase(); return e; },
+      createTextNode() { return me(); }, createDocumentFragment() { return me(); },
+      createComment() { return me(); },
+      body: me(), head: me(), cookie: "", addEventListener() {}, removeEventListener() {},
+      documentElement: { style: {} }, readyState: "complete", currentScript: { dataset: {} },
+      getElementsByTagName() { return []; }, getElementsByClassName() { return []; },
+      getElementsByName() { return []; }, title: "", domain: parsedUrl.hostname,
+      hasFocus() { return true; }, hidden: false, visibilityState: "visible",
     },
+    // Return '1' for all localStorage keys — the obfuscated script gates jwplayer on this
+    localStorage: { getItem() { return "1"; }, setItem() {}, removeItem() {}, clear() {} },
+    sessionStorage: { getItem() { return null; }, setItem() {}, removeItem() {}, clear() {} },
+    navigator: { userAgent: UA, platform: "Win32", language: "en-US", languages: ["en-US"], cookieEnabled: true, onLine: true },
+    location: { href: playerUrl, hostname: parsedUrl.hostname, host: parsedUrl.host, origin: parsedUrl.origin, protocol: "https:", pathname: parsedUrl.pathname, search: parsedUrl.search, hash: "" },
+    history: { pushState() {}, replaceState() {}, back() {}, forward() {}, go() {}, length: 1 },
+    performance: { now() { return Date.now(); } },
+    XMLHttpRequest: function() { this.open = function() {}; this.send = function() {}; this.setRequestHeader = function() {}; this.addEventListener = function() {}; },
+    fetch: function() { return Promise.resolve({ ok: true, json() { return Promise.resolve({}); }, text() { return Promise.resolve(""); }, headers: { get() { return null; } } }); },
     Cookies: { get() { return null; }, set() {} },
+    jQuery: jqProxy, $: jqProxy,
+    jwplayer: mockJw,
+    Image: function() { this.src = ""; },
+    crypto: { getRandomValues(a) { for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256); return a; } },
+    MutationObserver: function() { this.observe = function() {}; this.disconnect = function() {}; },
+    Event: function(t) { this.type = t; this.preventDefault = function() {}; this.stopPropagation = function() {}; },
+    requestAnimationFrame: function(fn) { return setTimeout(fn, 16); }, cancelAnimationFrame: clearTimeout,
+    alert() {}, confirm() { return false; }, prompt() { return null; },
+    open() { return null; }, close() {}, postMessage() {},
+    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    getComputedStyle() { return new Proxy({}, { get() { return ""; } }); },
+    matchMedia() { return { matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} }; },
+    innerWidth: 1920, innerHeight: 1080, screen: { width: 1920, height: 1080 }, devicePixelRatio: 1,
   };
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  sandbox.top = sandbox;
+  sandbox.parent = sandbox;
+  sandbox.globalThis = sandbox;
 
-  // jQuery mock
-  const jqResult = {
-    html(v) { return v !== undefined ? jqResult : ""; },
-    text(v) { return v !== undefined ? jqResult : ""; },
-    css() { return jqResult; }, attr() { return null; },
-    on() { return jqResult; }, click() { return jqResult; },
-    ready(fn) { try { fn(); } catch(e) {} return jqResult; },
-    find() { return jqResult; }, each() { return jqResult; },
-    addClass() { return jqResult; }, removeClass() { return jqResult; },
-    append() { return jqResult; }, prepend() { return jqResult; },
-    val() { return ""; }, hide() { return jqResult; }, show() { return jqResult; },
-    remove() { return jqResult; }, length: 0,
-  };
-  const jqFn = function(sel) { if (typeof sel === "function") { try { sel(); } catch(e) {} } return jqResult; };
-  jqFn.ajax = function() {};
-  jqFn.get = function() {};
-  jqFn.post = function() {};
-  mockGlobals.jQuery = jqFn;
-  mockGlobals.$ = jqFn;
-
-  // jwplayer mock
-  mockGlobals.jwplayer = function(id) {
-    const p = {
-      setup(config) { capturedConfig = config; return p; },
-      on() { return p; }, onReady() { return p; }, onComplete() { return p; },
-      onError() { return p; }, getPlaylistItem() { return {}; },
-      addButton() { return p; }, seek() { return p; },
-      getPosition() { return 0; }, getDuration() { return 0; },
-      getState() { return "idle"; }, play() { return p; },
-      pause() { return p; }, remove() { return p; },
-      resize() { return p; },
-      load(config) { capturedConfig = config; return p; },
-    };
-    return p;
-  };
-  mockGlobals.jwplayer.key = null;
-  mockGlobals.jwplayer.version = "8.33.2";
-
-  // Install mocks on global
-  for (const [k, v] of Object.entries(mockGlobals)) {
-    saved[k] = global[k];
-    global[k] = v;
-  }
+  vm.createContext(sandbox);
 
   try {
-    const fn = new Function(mainScript);
-    fn();
+    vm.runInContext(`try{${mainScript}}catch(_e_){}`, sandbox, { timeout: 10000, filename: "player.js" });
   } catch (e) {
-    console.log(`[Extract] Script error: ${e.message}`);
+    console.log(`[Extract] VM error: ${e.message}`);
   }
 
-  // Wait for click handler (overlay bypass via nextTick)
-  await new Promise(r => setTimeout(r, 100));
-
-  // Restore globals
-  for (const [k, v] of Object.entries(saved)) {
-    if (v === undefined) delete global[k];
-    else global[k] = v;
-  }
+  // Allow any scheduled timers to fire
+  await new Promise(r => setTimeout(r, 200));
 
   if (capturedConfig) {
-    // Extract URL from config
     let streamUrl = null;
     if (capturedConfig.sources && capturedConfig.sources.length > 0) {
       streamUrl = capturedConfig.sources[0].file;
@@ -1083,7 +1101,15 @@ async function extractStreamFromPlayer(playerUrl) {
     }
     if (streamUrl) {
       console.log(`[Extract] Got stream: ${streamUrl.substring(0, 80)}...`);
-      return { url: streamUrl, title: "FaselHD" };
+      // Extract quality labels if available
+      let qualityInfo = "";
+      if (capturedConfig.qualityLabels) {
+        const labels = Object.values(capturedConfig.qualityLabels)
+          .map(l => l.replace(/<[^>]*>/g, "").trim())
+          .filter(Boolean);
+        if (labels.length) qualityInfo = labels.join(", ");
+      }
+      return { url: streamUrl, title: "FaselHD", quality: qualityInfo };
     }
   }
 
@@ -1096,10 +1122,10 @@ async function extractStreamFromPlayer(playerUrl) {
 async function resolve(imdbId, type, season, episode) {
   console.log(`[Resolve] ${type} ${imdbId} S${season || "-"}E${episode || "-"}`);
 
-  // Parallelize IMDB lookup, domain discovery, and browser warm-up
+  // Parallelize IMDB lookup and domain discovery
   const [info] = await Promise.all([
     getImdbInfo(imdbId),
-    getDomain().then(() => ensureWorkerPage().catch(() => {})),
+    getDomain(),
   ]);
   if (!info) {
     console.log("[Resolve] IMDB lookup failed");
@@ -1190,12 +1216,13 @@ async function resolve(imdbId, type, season, episode) {
   // Get player_token URLs from the page
   const players = await getPlayerTokens(targetUrl);
 
-  // Extract streams from all servers (sequential — mocks use global)
+  // Extract streams from all servers
   for (const p of players) {
     const s = await extractStreamFromPlayer(p.url);
     if (s) {
-      const label = [p.quality, p.name].filter(Boolean).join(" | ");
-      streams.push({ url: s.url, title: label || "FaselHD" });
+      const parts = [p.quality, p.name, s.quality].filter(Boolean);
+      const label = parts.length ? parts.join(" | ") : "FaselHD";
+      streams.push({ url: s.url, title: label });
     }
   }
 
