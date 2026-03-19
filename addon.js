@@ -727,7 +727,7 @@ function parseSearchResults(html) {
   // Find all links pointing to content pages
   $("a[href]").each((_, el) => {
     const href = $(el).attr("href") || "";
-    if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/"))) {
+    if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/") || href.includes("/anime/"))) {
       // Normalize: strip query/hash, deduplicate
       const clean = href.split("?")[0].split("#")[0];
       if (seen.has(clean)) return;
@@ -798,7 +798,7 @@ async function searchFasel(query, year, type) {
       const f = results.filter((r) => r.url.includes("/movies/"));
       if (f.length) results = f;
     } else if (type === "series") {
-      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/"));
+      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/"));
       if (f.length) results = f;
     }
   }
@@ -879,6 +879,38 @@ async function getPlayerTokens(url) {
 
   console.log(`[Parse] ${url.substring(url.lastIndexOf("/") + 1, url.lastIndexOf("/") + 40)}... → ${tokens.length} player(s)`);
   return tokens;
+}
+
+// Extract season number from title/URL text (supports Arabic ordinals and digits)
+function extractSeasonNum(text) {
+  const arabicOrdinals = {
+    'الأول': 1, 'الاول': 1, 'الثاني': 2, 'الثانى': 2, 'الثالث': 3, 'الرابع': 4,
+    'الخامس': 5, 'السادس': 6, 'السابع': 7, 'الثامن': 8, 'التاسع': 9, 'العاشر': 10,
+  };
+  const decoded = decodeURIComponent(text);
+  // Check Arabic ordinals
+  for (const [word, num] of Object.entries(arabicOrdinals)) {
+    if (decoded.includes(word)) return num;
+  }
+  // Check for digit patterns like "الموسم 3", "Season 3", "S03"
+  const mDigit = decoded.match(/(?:الموسم|الجزء|season|الموسم)\s*(\d+)/i) || decoded.match(/\bS0?(\d+)\b/i);
+  if (mDigit) return parseInt(mDigit[1]);
+  return 0;
+}
+
+// Pick the right search result for a given season number (for anime-style separate entries)
+function pickSeasonResult(results, seasonNum) {
+  // Score each result by how well it matches the requested season
+  const scored = results.map(r => {
+    const combined = `${r.title} ${r.url}`;
+    const num = extractSeasonNum(combined);
+    return { ...r, seasonNum: num };
+  }).filter(r => r.seasonNum > 0);
+
+  if (scored.length === 0) return null;
+  const exact = scored.find(r => r.seasonNum === seasonNum);
+  if (exact) return exact;
+  return null;
 }
 
 // Parse a series page: extract season URLs and episode URLs
@@ -1217,6 +1249,15 @@ async function resolve(imdbId, type, season, episode) {
   if (type === "series" && season && episode) {
     const sn = parseInt(season);
     const ep = parseInt(episode);
+
+    // For anime/shows with separate entries per season, pick the right one
+    if (results.length > 1) {
+      const seasonResult = pickSeasonResult(results, sn);
+      if (seasonResult) {
+        console.log(`[Resolve] Matched season ${sn} from search results: ${seasonResult.url}`);
+        targetUrl = seasonResult.url;
+      }
+    }
 
     // Parse the first result's page for season/episode info
     let { seasons, episodes } = await parseSeriesPage(targetUrl);
