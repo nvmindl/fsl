@@ -1117,6 +1117,57 @@ async function extractStreamFromPlayer(playerUrl) {
   return null;
 }
 
+// ── Parse master m3u8 into individual quality variants ──
+async function parseMasterPlaylist(masterUrl) {
+  try {
+    const resp = await fetch(masterUrl, {
+      headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) return null;
+    const body = await resp.text();
+    if (!body.includes("#EXTM3U") || !body.includes("#EXT-X-STREAM-INF")) return null;
+
+    const lines = body.split("\n");
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+      const resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
+      const bwMatch = line.match(/BANDWIDTH=(\d+)/);
+      // Next non-empty, non-comment line is the URL
+      let url = "";
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j].trim();
+        if (next && !next.startsWith("#")) { url = next; break; }
+      }
+      if (!url) continue;
+      if (!url.startsWith("http")) {
+        const base = masterUrl.substring(0, masterUrl.lastIndexOf("/") + 1);
+        url = new URL(url, base).href;
+      }
+      const width = resMatch ? parseInt(resMatch[1]) : 0;
+      const height = resMatch ? parseInt(resMatch[2]) : 0;
+      const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+      // Try to extract quality from URL (e.g. hd1080b, hd720b, sd360b)
+      const urlQMatch = url.match(/(?:hd|sd)(\d{3,4})/i);
+      let label = "";
+      if (urlQMatch) label = `${urlQMatch[1]}p`;
+      else if (width >= 1920) label = "1080p";
+      else if (width >= 1280) label = "720p";
+      else if (width >= 854) label = "480p";
+      else if (width >= 640) label = "360p";
+      else if (height) label = `${height}p`;
+      variants.push({ url, width, height, bandwidth, label });
+    }
+    variants.sort((a, b) => b.bandwidth - a.bandwidth);
+    return variants.length > 0 ? variants : null;
+  } catch (e) {
+    console.log(`[ParseMaster] Error: ${e.message}`);
+    return null;
+  }
+}
+
 // ── Main resolver ──
 
 async function resolve(imdbId, type, season, episode) {
@@ -1220,9 +1271,8 @@ async function resolve(imdbId, type, season, episode) {
   for (const p of players) {
     const s = await extractStreamFromPlayer(p.url);
     if (s) {
-      const parts = [p.quality, p.name, s.quality].filter(Boolean);
-      const label = parts.length ? parts.join(" | ") : "FaselHD";
-      streams.push({ url: s.url, title: label });
+      const serverInfo = [p.quality, p.name].filter(Boolean).join(" | ") || "FaselHD";
+      streams.push({ url: s.url, title: serverInfo });
     }
   }
 
@@ -1260,21 +1310,37 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 
     const seen = new Set();
-    const streams = raw
-      .map((s) => {
+    const streams = [];
+
+    for (const s of raw) {
+      // Parse master m3u8 to split into individual quality streams
+      const variants = await parseMasterPlaylist(s.url);
+      if (variants && variants.length > 1) {
+        for (const v of variants) {
+          const proxiedUrl = `${proxyBase}/proxy/${Buffer.from(v.url).toString('base64url')}/stream.m3u8`;
+          if (seen.has(proxiedUrl)) continue;
+          seen.add(proxiedUrl);
+          const title = [v.label, s.title].filter(Boolean).join(" | ");
+          streams.push({
+            name: "FaselHD",
+            title: title || "FaselHD",
+            url: proxiedUrl,
+            behaviorHints: { notWebReady: false },
+          });
+        }
+      } else {
         const proxiedUrl = `${proxyBase}/proxy/${Buffer.from(s.url).toString('base64url')}/stream.m3u8`;
-        return {
-          name: "FaselHD",
-          title: s.title || "FaselHD",
-          url: proxiedUrl,
-          behaviorHints: { notWebReady: false },
-        };
-      })
-      .filter((s) => {
-        if (seen.has(s.url)) return false;
-        seen.add(s.url);
-        return true;
-      });
+        if (!seen.has(proxiedUrl)) {
+          seen.add(proxiedUrl);
+          streams.push({
+            name: "FaselHD",
+            title: s.title || "FaselHD",
+            url: proxiedUrl,
+            behaviorHints: { notWebReady: false },
+          });
+        }
+      }
+    }
 
     return { streams };
   } catch (err) {
