@@ -774,8 +774,10 @@ async function getPlayerTokens(url) {
 
   // Extract quality badge from page
   const $ = cheerio.load(html);
-  const qualityBadge = $(".quality, .مشاهدة").first().text().trim() ||
+  let qualityBadge = $(".quality, .مشاهدة").first().text().trim() ||
     (html.match(/(?:quality|الجودة)[^<]*?([0-9]{3,4}p[^<]{0,20})/i) || [])[1] || "";
+  // Strip any residual HTML tags/attributes
+  qualityBadge = qualityBadge.replace(/<[^>]*>/g, "").replace(/"[^"]*"/g, "").trim();
 
   // Extract player_token from iframes (data-src and src)
   let serverNum = 0;
@@ -1299,11 +1301,23 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        // Compute base URL for resolving relative paths
+        const upstreamBase = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+
         // Rewrite absolute URLs
         body = body.replace(/^(https?:\/\/[^\s]+)/gm, (url) => {
           const trimmed = url.trim();
           const ext = trimmed.endsWith('.m3u8') ? 'stream.m3u8' : 'segment.ts';
           return `${proxyBase}/proxy/${Buffer.from(trimmed).toString('base64url')}/${ext}`;
+        });
+
+        // Rewrite relative URLs (non-comment, non-empty lines not already absolute)
+        body = body.replace(/^(?!#)(?!https?:\/\/)(\S+)/gm, (relPath) => {
+          const trimmed = relPath.trim();
+          if (!trimmed) return relPath;
+          const absUrl = new URL(trimmed, upstreamBase).href;
+          const ext = trimmed.endsWith('.m3u8') ? 'stream.m3u8' : 'segment.ts';
+          return `${proxyBase}/proxy/${Buffer.from(absUrl).toString('base64url')}/${ext}`;
         });
         res.writeHead(200, {
           "Content-Type": "application/vnd.apple.mpegurl",
