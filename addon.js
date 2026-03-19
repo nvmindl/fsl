@@ -794,6 +794,18 @@ async function searchFasel(query, year, type) {
     }
   }
 
+  // Strategy 3: Browser-based search (Puppeteer navigates the search page)
+  if (!results.length) {
+    results = await searchViaBrowser(query, domain);
+    if (type === "movie") {
+      const f = results.filter((r) => r.url.includes("/movies/"));
+      if (f.length) results = f;
+    } else if (type === "series") {
+      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/"));
+      if (f.length) results = f;
+    }
+  }
+
   console.log(`[Search] "${query}" → ${results.length} result(s)`);
   results.slice(0, 5).forEach((r, i) => console.log(`  ${i}: ${r.url}`));
   if (results.length > 0) cacheSet(cache.search, cacheKey, results);
