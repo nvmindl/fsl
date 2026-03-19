@@ -1508,6 +1508,21 @@ const addonInterface = builder.getInterface();
 const router = getRouter(addonInterface);
 
 const http = require("http");
+
+// Play session cache for /play/ endpoint
+const playCache = {};
+const playResolving = {};
+// Clean up expired sessions every 5 minutes (sessions live 30 min)
+setInterval(() => {
+  const now = Date.now();
+  for (const key of Object.keys(playCache)) {
+    if (now - playCache[key].created > 30 * 60 * 1000) {
+      delete playCache[key];
+      console.log(`[Play] Expired session: ${key}`);
+    }
+  }
+}, 5 * 60 * 1000);
+
 const server = http.createServer(async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -1637,6 +1652,205 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(502, { "Content-Type": "text/plain" });
         res.end(`Proxy error: ${err.message}`);
       }
+    }
+    return;
+  }
+
+  // ── /play/ endpoint — short-URL HLS for external players ──
+  // Format: /play/:type/:imdbId[:season:episode]/:qualityIndex/master.m3u8
+  //         /play/:type/:imdbId[:season:episode]/:qualityIndex/s/:segNum.ts
+  const playMatch = req.url.match(/^\/play\/([^/]+)\/([^/]+)\/(\d+)\/(master\.m3u8|s\/(\d+)\.ts)$/);
+  if (playMatch) {
+    const [, pType, pId, pQuality, pPath, pSegNum] = playMatch;
+    const sessionKey = `${pType}/${pId}/${pQuality}`;
+
+    // Lazily resolve and cache sessions
+    if (!playCache[sessionKey]) {
+      if (playResolving[sessionKey]) {
+        // Another request is already resolving — wait for it
+        await playResolving[sessionKey];
+      } else {
+        console.log(`[Play] Resolving: ${sessionKey}`);
+        const parts = pId.split(":");
+        const imdbId = parts[0];
+        const season = parts[1] || null;
+        const episode = parts[2] || null;
+        playResolving[sessionKey] = (async () => {
+          try {
+            const raw = await resolve(imdbId, pType, season, episode);
+            const qi = parseInt(pQuality);
+            if (!raw.length) throw new Error("No streams found");
+
+            // For each raw stream, fetch the master m3u8 to get quality variants
+            let targetUrl = null;
+            let allVariants = [];
+            for (const s of raw) {
+              const variants = await parseMasterPlaylist(s.url);
+              if (variants && variants.length > 0) {
+                for (const v of variants) {
+                  allVariants.push({ url: v.url, label: v.label, title: s.title });
+                }
+              } else {
+                allVariants.push({ url: s.url, label: "auto", title: s.title });
+              }
+            }
+
+            if (qi >= allVariants.length) throw new Error("Quality index out of range");
+            targetUrl = allVariants[qi].url;
+
+            // Fetch the actual m3u8 playlist from CDN
+            const m3u8Resp = await fetch(targetUrl, {
+              headers: { "User-Agent": UA },
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!m3u8Resp.ok) throw new Error(`CDN returned ${m3u8Resp.status}`);
+            const m3u8Body = await m3u8Resp.text();
+            if (!m3u8Body.includes("#EXTM3U")) throw new Error("Invalid m3u8");
+
+            const m3u8Base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
+
+            // Parse segment URLs
+            const segments = [];
+            const lines = m3u8Body.split("\n");
+            const rewrittenLines = [];
+            let segIdx = 0;
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith("#")) {
+                rewrittenLines.push(trimmed);
+                continue;
+              }
+              // This is a segment URL
+              let absUrl;
+              if (trimmed.startsWith("http")) {
+                absUrl = trimmed;
+              } else {
+                absUrl = new URL(trimmed, m3u8Base).href;
+              }
+              segments.push(absUrl);
+              rewrittenLines.push(`s/${segIdx}.ts`);
+              segIdx++;
+            }
+
+            playCache[sessionKey] = {
+              m3u8: rewrittenLines.join("\n"),
+              segments,
+              created: Date.now(),
+            };
+          } catch (err) {
+            console.error(`[Play] Resolve error: ${err.message}`);
+          }
+          delete playResolving[sessionKey];
+        })();
+        await playResolving[sessionKey];
+      }
+    }
+
+    const session = playCache[sessionKey];
+    if (!session) {
+      res.writeHead(503, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+      res.end("Stream not available");
+      return;
+    }
+
+    // Extend TTL on access
+    session.created = Date.now();
+
+    if (pPath === "master.m3u8") {
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache",
+      });
+      res.end(session.m3u8);
+      return;
+    }
+
+    // Segment request
+    const segIdx = parseInt(pSegNum);
+    if (segIdx >= session.segments.length) {
+      res.writeHead(404, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+      res.end("Segment not found");
+      return;
+    }
+
+    try {
+      const segUrl = session.segments[segIdx];
+      const upstream = await fetch(segUrl, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!upstream.ok) {
+        res.writeHead(upstream.status, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+        res.end(`Upstream: ${upstream.status}`);
+        return;
+      }
+      const headers = {
+        "Content-Type": upstream.headers.get("content-type") || "video/MP2T",
+        "Access-Control-Allow-Origin": "*",
+      };
+      const cl = upstream.headers.get("content-length");
+      if (cl) headers["Content-Length"] = cl;
+      res.writeHead(200, headers);
+      const reader = upstream.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+      res.end();
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+        res.end(`Proxy error: ${err.message}`);
+      }
+    }
+    return;
+  }
+
+  // ── /streams/ endpoint — returns available quality variants for Nuvio ──
+  const streamsMatch = req.url.match(/^\/streams\/([^/]+)\/([^/]+)\.json$/);
+  if (streamsMatch) {
+    const [, sType, sId] = streamsMatch;
+    const parts = sId.split(":");
+    const imdbId = parts[0];
+    const season = parts[1] || null;
+    const episode = parts[2] || null;
+
+    try {
+      console.log(`[Streams] ${sType} ${sId}`);
+      const raw = await resolve(imdbId, sType, season, episode);
+      const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+
+      const streams = [];
+      let qualityIdx = 0;
+      for (const s of raw) {
+        const variants = await parseMasterPlaylist(s.url);
+        if (variants && variants.length > 0) {
+          for (const v of variants) {
+            streams.push({
+              name: "FaselHD",
+              title: [v.label, s.title].filter(Boolean).join(" | "),
+              url: `${proxyBase}/play/${sType}/${sId}/${qualityIdx}/master.m3u8`,
+            });
+            qualityIdx++;
+          }
+        } else {
+          streams.push({
+            name: "FaselHD",
+            title: s.title || "FaselHD",
+            url: `${proxyBase}/play/${sType}/${sId}/${qualityIdx}/master.m3u8`,
+          });
+          qualityIdx++;
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ streams }));
+    } catch (err) {
+      console.error(`[Streams] Error: ${err.message}`);
+      res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ streams: [] }));
     }
     return;
   }
