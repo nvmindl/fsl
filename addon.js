@@ -467,6 +467,19 @@ function markDomainBad() {
   workerDomain = null; // force worker page recreation on new domain
 }
 
+// Learn the working domain from a redirect target URL
+function learnDomainFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const origin = u.origin;
+    if (isFaselUrl(origin) && origin !== activeDomain) {
+      console.log(`[Domain] Learned working domain from redirect: ${origin}`);
+      activeDomain = origin;
+      domainLastCheck = Date.now();
+    }
+  } catch {}
+}
+
 // ── HTTP ──
 
 const UA =
@@ -629,29 +642,24 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   const allResults = [];
   let found = false;
 
-  // Fetch all sitemaps in parallel, process results as they arrive
-  let domainDead = false;
+  // Fetch all sitemaps in parallel, following redirects to find working domain
   const fetches = [];
   for (let i = 1; i <= maxNum; i++) {
     fetches.push(
       fetch(`${domain}/${prefix}-sitemap${i}.xml`, {
         headers: { "User-Agent": UA },
-        redirect: "manual",
+        redirect: "follow",
         signal: AbortSignal.timeout(12000),
       })
         .then(async (resp) => {
-          // Detect domain rotation (301/302 redirect)
-          if (resp.status >= 300 && resp.status < 400) {
-            domainDead = true;
-            return;
-          }
           if (!resp.ok || found) return;
+          // Learn working domain from redirect target
+          learnDomainFromUrl(resp.url);
           const xml = await resp.text();
           if (xml.includes("Just a moment")) return;
           const matches = searchInXml(xml, slug, year);
           if (matches.length > 0) {
             allResults.push(...matches);
-            // If we found a match with year, mark as found
             if (matches.some(r => r.score >= 10)) found = true;
           }
         })
@@ -660,21 +668,8 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   }
   await Promise.all(fetches);
 
-  // If domain rotated, trigger re-discovery and retry with new domain
-  if (domainDead && allResults.length === 0) {
-    console.log(`[Sitemap] Domain ${domain} rotated, discovering new one...`);
-    markDomainBad();
-    const newDomain = await getDomain();
-    if (newDomain !== domain) {
-      console.log(`[Sitemap] Retrying with ${newDomain}`);
-      return searchSitemaps(newDomain, prefix, maxNum, slug, year);
-    }
-  }
-
-  // If no exact year match but we have results, that's fine
-  if (allResults.length === 0 && !found) return [];
+  if (allResults.length === 0) return [];
   allResults.sort((a, b) => b.score - a.score);
-  // Normalize URLs to use the active domain
   const currentDomain = await getDomain();
   return allResults.map(r => ({
     ...r,
@@ -682,78 +677,66 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   }));
 }
 
-async function searchViaRSS(query, domain) {
+// ── Website search (fast HTTP, follows redirects, finds everything) ──
+async function searchWebsite(query, domain) {
   try {
-    const url = `${domain}/feed/?s=${encodeURIComponent(query)}`;
-    console.log(`[RSS] ${url}`);
-    let xml;
-    try {
-      const resp = await fetch(url, {
-        headers: { ...HEADERS, Accept: "application/rss+xml,application/xml,text/xml" },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (resp.ok) {
-        xml = await resp.text();
-        if (xml.includes("Just a moment") || xml.includes("Checking your browser")) {
-          xml = null;
-        }
-      }
-    } catch {}
-    if (!xml) return [];
-
-    const $ = cheerio.load(xml, { xmlMode: true });
-    const results = [];
-    $("item").each((_, el) => {
-      const title = $(el).find("title").text().trim();
-      const link = $(el).find("link").text().trim();
-      if (link) results.push({ url: link, title });
+    const searchUrl = `${domain}/?s=${encodeURIComponent(query)}`;
+    console.log(`[WebSearch] ${searchUrl}`);
+    const resp = await fetch(searchUrl, {
+      headers: { ...HEADERS },
+      redirect: "follow",
+      signal: AbortSignal.timeout(15000),
     });
-    console.log(`[RSS] Found ${results.length} result(s)`);
-    return results;
+    if (!resp.ok) {
+      console.log(`[WebSearch] HTTP ${resp.status}`);
+      return [];
+    }
+    // Learn working domain from redirect target
+    learnDomainFromUrl(resp.url);
+    const html = await resp.text();
+    if (html.includes("Just a moment") || html.includes("Checking your browser")) {
+      console.log("[WebSearch] CF blocked, will try browser fallback");
+      return [];
+    }
+    return parseSearchResults(html);
   } catch (err) {
-    console.error(`[RSS] ${err.message}`);
+    console.error(`[WebSearch] ${err.message}`);
     return [];
   }
 }
 
-// ── Browser-based search (fallback when sitemaps + RSS fail) ──
+// ── Browser-based search (fallback when HTTP is CF-blocked) ──
 async function searchViaBrowser(query, domain) {
   try {
     const searchUrl = `${domain}/?s=${encodeURIComponent(query)}`;
     console.log(`[BrowserSearch] ${searchUrl}`);
     const html = await fetchPage(searchUrl);
     if (!html) return [];
-
-    const $ = cheerio.load(html);
-    const results = [];
-    // FaselHD search results: div.postDiv or article elements with links
-    $("div.postDiv a, .searchResult a, article a, .result-item a, a.hoverable").each((_, el) => {
-      const href = $(el).attr("href") || "";
-      if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/"))) {
-        const title = $(el).text().trim() || $(el).attr("title") || "";
-        if (!results.some(r => r.url === href)) {
-          results.push({ url: href, title });
-        }
-      }
-    });
-    // Also try generic content links with known URL patterns
-    if (results.length === 0) {
-      $("a[href]").each((_, el) => {
-        const href = $(el).attr("href") || "";
-        if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/"))) {
-          const title = $(el).text().trim() || "";
-          if (title.length > 2 && !results.some(r => r.url === href)) {
-            results.push({ url: href, title });
-          }
-        }
-      });
-    }
-    console.log(`[BrowserSearch] Found ${results.length} result(s)`);
-    return results;
+    return parseSearchResults(html);
   } catch (err) {
     console.error(`[BrowserSearch] ${err.message}`);
     return [];
   }
+}
+
+function parseSearchResults(html) {
+  const $ = cheerio.load(html);
+  const results = [];
+  const seen = new Set();
+  // Find all links pointing to content pages
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href") || "";
+    if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/"))) {
+      // Normalize: strip query/hash, deduplicate
+      const clean = href.split("?")[0].split("#")[0];
+      if (seen.has(clean)) return;
+      seen.add(clean);
+      const title = $(el).text().trim() || $(el).attr("title") || "";
+      results.push({ url: clean, title });
+    }
+  });
+  console.log(`[ParseSearch] ${results.length} result(s)`);
+  return results;
 }
 
 // ── FaselHD Search ──
@@ -769,34 +752,30 @@ async function searchFasel(query, year, type) {
 
   let results = [];
 
-  // Strategy 1: On-demand sitemap search (works from datacenter, no CF)
-  if (type === "movie") {
-    results = await searchSitemaps(domain, "movies", 14, slug, year);
-  } else if (type === "series") {
-    results = await searchSitemaps(domain, "seasons", 4, slug, year);
-    if (!results.length) results = await searchSitemaps(domain, "series", 8, slug, year);
-  } else {
-    results = await searchSitemaps(domain, "movies", 14, slug, year);
-    if (!results.length) results = await searchSitemaps(domain, "seasons", 4, slug, year);
-    if (!results.length) results = await searchSitemaps(domain, "series", 8, slug, year);
-  }
+  // Strategy 1: Website search (fast HTTP, follows redirects, finds ALL content)
+  results = await searchWebsite(query, domain);
 
-  // Strategy 2: RSS feed fallback (works from residential IPs)
+  // Strategy 2: Sitemap search (fallback if website search is CF-blocked)
   if (!results.length) {
-    results = await searchViaRSS(query, domain);
-    // Filter by type
     if (type === "movie") {
-      const f = results.filter((r) => r.url.includes("/movies/"));
-      if (f.length) results = f;
+      results = await searchSitemaps(domain, "movies", 14, slug, year);
     } else if (type === "series") {
-      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/"));
-      if (f.length) results = f;
+      results = await searchSitemaps(domain, "seasons", 4, slug, year);
+      if (!results.length) results = await searchSitemaps(domain, "series", 8, slug, year);
+    } else {
+      results = await searchSitemaps(domain, "movies", 14, slug, year);
+      if (!results.length) results = await searchSitemaps(domain, "seasons", 4, slug, year);
+      if (!results.length) results = await searchSitemaps(domain, "series", 8, slug, year);
     }
   }
 
-  // Strategy 3: Browser-based search (Puppeteer navigates the search page)
+  // Strategy 3: Browser-based search (Puppeteer, last resort)
   if (!results.length) {
     results = await searchViaBrowser(query, domain);
+  }
+
+  // Filter by type
+  if (results.length > 0) {
     if (type === "movie") {
       const f = results.filter((r) => r.url.includes("/movies/"));
       if (f.length) results = f;
@@ -1101,8 +1080,11 @@ async function extractStreamFromPlayer(playerUrl) {
 async function resolve(imdbId, type, season, episode) {
   console.log(`[Resolve] ${type} ${imdbId} S${season || "-"}E${episode || "-"}`);
 
-  // Parallelize IMDB lookup and domain warm-up
-  const [info] = await Promise.all([getImdbInfo(imdbId), getDomain()]);
+  // Parallelize IMDB lookup, domain discovery, and browser warm-up
+  const [info] = await Promise.all([
+    getImdbInfo(imdbId),
+    getDomain().then(() => ensureWorkerPage().catch(() => {})),
+  ]);
   if (!info) {
     console.log("[Resolve] IMDB lookup failed");
     return [];
@@ -1270,7 +1252,7 @@ const server = http.createServer(async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Global request timeout: 90s max per request
+  // Global request timeout: 120s max per request
   const requestTimeout = setTimeout(() => {
     if (!res.headersSent && !res.writableEnded) {
       console.log(`[TIMEOUT] Request timed out: ${req.url}`);
@@ -1279,7 +1261,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "Request timed out" }));
       } catch {}
     }
-  }, 90000);
+  }, 120000);
   res.on("finish", () => clearTimeout(requestTimeout));
   res.on("close", () => clearTimeout(requestTimeout));
   // ── M3U8/segment proxy (bypasses IP-locked streams) ──
