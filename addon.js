@@ -337,159 +337,172 @@ const DOMAIN_TTL = 5 * 60 * 1000; // 5 min — check more often since domains ro
 let domainDiscoveryPromise = null;
 
 async function discoverDomain() {
-  // 1. If we have a webXx domain, check if it's still alive (not redirecting)
-  if (activeDomain !== MAIN_DOMAIN && activeDomain.includes(DOMAIN_BASE)) {
+  const t0 = Date.now();
+
+  // Helper: probe a single domain, returns working domain or null
+  async function probe(domain, ac) {
     try {
-      const resp = await fetch(`${activeDomain}/`, {
+      const resp = await fetch(`${domain}/`, {
         redirect: "manual",
         headers: { "User-Agent": UA },
-        signal: AbortSignal.timeout(5000),
+        signal: ac ? ac.signal : AbortSignal.timeout(3000),
       });
-      if (resp.status === 200) {
-        console.log(`[Domain] Current domain still alive: ${activeDomain}`);
-        domainLastCheck = Date.now();
-        return activeDomain;
-      }
-      // Domain is redirecting — check Location header for new domain
+      if (resp.status === 200) return domain;
       if (resp.status === 301 || resp.status === 302) {
         const loc = resp.headers.get("location") || "";
-        console.log(`[Domain] Current domain redirecting to: ${loc}`);
-        const newDomain = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-        if (newDomain) {
-          activeDomain = newDomain[0].replace(/^http:/, "https:");
-          domainLastCheck = Date.now();
-          console.log(`[Domain] Followed redirect to: ${activeDomain}`);
-          return activeDomain;
+        const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+        if (m) {
+          const target = m[0].replace(/^http:/, "https:");
+          // Verify the redirect target is actually alive
+          const resp2 = await fetch(`${target}/`, {
+            redirect: "manual",
+            headers: { "User-Agent": UA },
+            signal: ac ? ac.signal : AbortSignal.timeout(3000),
+          });
+          if (resp2.status === 200) return target;
         }
       }
     } catch {}
+    return null;
   }
 
-  // 2. Try swapping TLD (.xyz ↔ .best) with same number — often one TLD dies but the other works
+  function applyFound(domain) {
+    const changed = domain !== activeDomain;
+    activeDomain = domain;
+    domainLastCheck = Date.now();
+    if (changed) { cache.page.clear(); cache.search.clear(); }
+    console.log(`[Domain] Resolved: ${domain} (${Date.now() - t0}ms)`);
+    return domain;
+  }
+
+  // ── Phase 1: Quick check current domain + TLD swap (parallel, <2s) ──
   const numMatch = activeDomain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
+  const quickCandidates = [];
+  if (activeDomain !== MAIN_DOMAIN && activeDomain.includes(DOMAIN_BASE)) {
+    quickCandidates.push(activeDomain);
+  }
   if (numMatch) {
     const num = numMatch[1];
-    const currentTld = numMatch[2];
-    const otherTlds = ['best', 'xyz'].filter(t => t !== currentTld);
-    for (const tld of otherTlds) {
-      const tryDomain = `https://web${num}x.${DOMAIN_BASE}.${tld}`;
-      try {
-        const resp = await fetch(`${tryDomain}/`, {
-          redirect: "manual",
-          headers: { "User-Agent": UA },
-          signal: AbortSignal.timeout(4000),
-        });
-        if (resp.status === 200) {
-          activeDomain = tryDomain;
-          domainLastCheck = Date.now();
-          console.log(`[Domain] TLD swap found: ${activeDomain}`);
-          return activeDomain;
-        }
-      } catch {}
+    const tld = numMatch[2];
+    for (const t of ['best', 'xyz']) {
+      const d = `https://web${num}x.${DOMAIN_BASE}.${t}`;
+      if (d !== activeDomain) quickCandidates.push(d);
     }
   }
 
-  // 3. Quick scan — try nearby numbers on both TLDs
-  const lastNum = numMatch ? parseInt(numMatch[1]) : 31912;
-  console.log(`[Domain] Scanning from ${lastNum}...`);
-
-  // Scan in batches: close range first, then wider
-  const ranges = [
-    { start: -5, end: 5 },      // immediate neighbors
-    { start: 6, end: 50 },       // near range
-    { start: 51, end: 300 },     // wider range
-    { start: -50, end: -6 },     // older numbers
-  ];
-
-  for (const range of ranges) {
-    const batch = [];
-    for (let offset = range.start; offset <= range.end; offset++) {
-      for (const tld of ['best', 'xyz']) {
-        batch.push(`https://web${lastNum + offset}x.${DOMAIN_BASE}.${tld}`);
-      }
-    }
-
-    const results = await Promise.all(
-      batch.map(async (domain) => {
-        try {
-          const resp = await fetch(`${domain}/`, {
-            redirect: "manual",
-            headers: { "User-Agent": UA },
-            signal: AbortSignal.timeout(3000),
-          });
-          if (resp.status === 200) return domain;
-          // Also check if redirect points to a new working domain
-          if (resp.status === 301 || resp.status === 302) {
-            const loc = resp.headers.get("location") || "";
-            const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-            if (m) return m[0].replace(/^http:/, "https:");
-          }
-        } catch {}
-        return null;
-      })
-    );
-
-    const found = results.find(Boolean);
-    if (found) {
-      activeDomain = found;
-      domainLastCheck = Date.now();
-      // Clear page cache since domain changed
-      cache.page.clear();
-      cache.search.clear();
-      console.log(`[Domain] Discovered via scan: ${activeDomain}`);
-      return activeDomain;
-    }
-  }
-
-  // 4. Puppeteer fallback — visit main domain through CF
-  console.log("[Domain] Scan failed, trying Puppeteer...");
-  try {
-    const browser = await getBrowser();
-    const page = await browser.newPage();
+  if (quickCandidates.length) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 2000);
     try {
-      await page.setUserAgent(UA);
-      await page.goto(MAIN_DOMAIN, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-      const content = await page.content();
-      if (content.includes("Just a moment") || content.includes("Checking your browser")) {
-        console.log("[Domain] CF challenge, waiting...");
-        await page.waitForFunction(
-          () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
-          { timeout: 20000 }
-        ).catch(() => {});
-      }
-
-      const finalUrl = page.url();
-      console.log(`[Domain] Browser landed on: ${finalUrl}`);
-
-      const m = finalUrl.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-      if (m) {
-        activeDomain = m[0].replace(/^http:/, "https:");
-        domainLastCheck = Date.now();
-        cache.page.clear();
-        cache.search.clear();
-        console.log(`[Domain] Discovered: ${activeDomain}`);
-        return activeDomain;
-      }
-
-      const html = await page.content();
-      const linkMatch = html.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-      if (linkMatch) {
-        activeDomain = linkMatch[0].replace(/^http:/, "https:");
-        domainLastCheck = Date.now();
-        cache.page.clear();
-        cache.search.clear();
-        console.log(`[Domain] Discovered from page links: ${activeDomain}`);
-        return activeDomain;
-      }
-    } finally {
-      await page.close().catch(() => {});
-    }
-  } catch (e) {
-    console.log(`[Domain] Puppeteer discovery failed: ${e.message}`);
+      const result = await Promise.any(
+        quickCandidates.map(d => probe(d, ac).then(r => r || Promise.reject()))
+      );
+      clearTimeout(timer);
+      ac.abort(); // cancel remaining
+      return applyFound(result);
+    } catch { clearTimeout(timer); }
   }
 
-  console.log("[Domain] Could not discover, using last known");
+  // ── Phase 2: Parallel scan ALL ranges at once, race for first hit (<8s) ──
+  const lastNum = numMatch ? parseInt(numMatch[1]) : 31912;
+  console.log(`[Domain] Scanning ±300 from ${lastNum}...`);
+
+  // Build all candidates at once — nearby first for faster resolution
+  const allCandidates = [];
+  // Nearby (±5) first, then expanding
+  for (let d = 0; d <= 300; d++) {
+    for (const sign of [1, -1]) {
+      const n = lastNum + d * sign;
+      if (n < 1) continue;
+      for (const tld of ['best', 'xyz']) {
+        allCandidates.push(`https://web${n}x.${DOMAIN_BASE}.${tld}`);
+      }
+    }
+  }
+  // Deduplicate (offset 0 appears twice)
+  const seen = new Set();
+  const unique = allCandidates.filter(d => seen.has(d) ? false : (seen.add(d), true));
+
+  // Race: fire all probes, first 200 wins, abort the rest
+  // Limit concurrency to avoid overwhelming the network (50 at a time)
+  const CONCURRENCY = 60;
+  const ac2 = new AbortController();
+  let found = null;
+
+  const raceTimer = setTimeout(() => ac2.abort(), 8000);
+
+  try {
+    found = await new Promise((resolve, reject) => {
+      let idx = 0;
+      let inFlight = 0;
+      let done = false;
+
+      function launch() {
+        while (inFlight < CONCURRENCY && idx < unique.length && !done) {
+          const domain = unique[idx++];
+          inFlight++;
+          probe(domain, ac2).then(result => {
+            inFlight--;
+            if (done) return;
+            if (result) {
+              done = true;
+              ac2.abort();
+              resolve(result);
+            } else {
+              launch(); // fill the slot
+            }
+            if (inFlight === 0 && idx >= unique.length && !done) {
+              done = true;
+              reject(new Error("exhausted"));
+            }
+          });
+        }
+      }
+      launch();
+      // Safety: if nothing launches
+      if (idx === 0) reject(new Error("no candidates"));
+    });
+  } catch {}
+
+  clearTimeout(raceTimer);
+
+  if (found) return applyFound(found);
+
+  // ── Phase 3: Puppeteer fallback (<15s total budget) ──
+  const remaining = 15000 - (Date.now() - t0);
+  if (remaining > 3000) {
+    console.log(`[Domain] Scan exhausted, Puppeteer fallback (${remaining}ms budget)...`);
+    try {
+      const browser = await getBrowser();
+      const page = await browser.newPage();
+      try {
+        await page.setUserAgent(UA);
+        await page.goto(MAIN_DOMAIN, { waitUntil: "domcontentloaded", timeout: Math.min(remaining - 1000, 12000) });
+
+        const content = await page.content();
+        if (content.includes("Just a moment") || content.includes("Checking your browser")) {
+          await page.waitForFunction(
+            () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+            { timeout: Math.min(remaining - 2000, 8000) }
+          ).catch(() => {});
+        }
+
+        const finalUrl = page.url();
+        const m = finalUrl.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+        if (m) return applyFound(m[0].replace(/^http:/, "https:"));
+
+        const html = await page.content();
+        const linkMatch = html.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+        if (linkMatch) return applyFound(linkMatch[0].replace(/^http:/, "https:"));
+      } finally {
+        await page.close().catch(() => {});
+      }
+    } catch (e) {
+      console.log(`[Domain] Puppeteer failed: ${e.message}`);
+    }
+  }
+
+  console.log(`[Domain] Discovery failed after ${Date.now() - t0}ms, using last known`);
   domainLastCheck = Date.now();
   return activeDomain;
 }
