@@ -742,7 +742,7 @@ function parseSearchResults(html) {
 // ── FaselHD Search ──
 
 async function searchFasel(query, year, type) {
-  const domain = await getDomain();
+  let domain = await getDomain();
   const cacheKey = `${query}|${year}|${type}`;
   const cached = cacheGet(cache.search, cacheKey, SEARCH_TTL);
   if (cached) return cached;
@@ -750,12 +750,29 @@ async function searchFasel(query, year, type) {
   const slug = slugify(query);
   console.log(`[Search] query="${query}" slug="${slug}" year=${year} type=${type}`);
 
+  // If domain is the CF-protected main domain, probe a sitemap to discover the working domain
+  if (domain === MAIN_DOMAIN || domain.includes("fasel-hd.cam")) {
+    console.log("[Search] Main domain is CF-protected, probing sitemap for redirect...");
+    try {
+      const probe = await fetch(`${domain}/movies-sitemap1.xml`, {
+        headers: { "User-Agent": UA },
+        redirect: "follow",
+        signal: AbortSignal.timeout(10000),
+      });
+      if (probe.ok) {
+        learnDomainFromUrl(probe.url);
+        domain = await getDomain();
+        console.log(`[Search] Discovered working domain: ${domain}`);
+      }
+    } catch {}
+  }
+
   let results = [];
 
   // Strategy 1: Website search (fast HTTP, follows redirects, finds ALL content)
   results = await searchWebsite(query, domain);
 
-  // Strategy 2: Sitemap search (fallback if website search is CF-blocked)
+  // Strategy 2: Sitemap search (fallback if website search fails)
   if (!results.length) {
     if (type === "movie") {
       results = await searchSitemaps(domain, "movies", 14, slug, year);
