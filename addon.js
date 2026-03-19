@@ -307,12 +307,10 @@ async function browserFetch(url, timeout = 30000) {
 const cache = {
   imdb: new Map(),    // imdbId → { title, year, ts }
   search: new Map(),  // "query|year" → { results, ts }
-  stream: new Map(),  // imdbId:s:e → { streams, ts }
   page: new Map(),    // url → { html, ts } — short-lived, avoids re-fetching same URL
 };
 const IMDB_TTL = 24 * 60 * 60 * 1000;   // 24h
-const SEARCH_TTL = 60 * 60 * 1000;        // 1h (sitemap-based, stable results)
-const STREAM_TTL = 60 * 60 * 1000;       // 1h
+const SEARCH_TTL = 15 * 60 * 1000;        // 15min
 
 function cacheGet(store, key, ttl) {
   const entry = store.get(key);
@@ -718,6 +716,46 @@ async function searchViaRSS(query, domain) {
   }
 }
 
+// ── Browser-based search (fallback when sitemaps + RSS fail) ──
+async function searchViaBrowser(query, domain) {
+  try {
+    const searchUrl = `${domain}/?s=${encodeURIComponent(query)}`;
+    console.log(`[BrowserSearch] ${searchUrl}`);
+    const html = await fetchPage(searchUrl);
+    if (!html) return [];
+
+    const $ = cheerio.load(html);
+    const results = [];
+    // FaselHD search results: div.postDiv or article elements with links
+    $("div.postDiv a, .searchResult a, article a, .result-item a, a.hoverable").each((_, el) => {
+      const href = $(el).attr("href") || "";
+      if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/"))) {
+        const title = $(el).text().trim() || $(el).attr("title") || "";
+        if (!results.some(r => r.url === href)) {
+          results.push({ url: href, title });
+        }
+      }
+    });
+    // Also try generic content links with known URL patterns
+    if (results.length === 0) {
+      $("a[href]").each((_, el) => {
+        const href = $(el).attr("href") || "";
+        if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/"))) {
+          const title = $(el).text().trim() || "";
+          if (title.length > 2 && !results.some(r => r.url === href)) {
+            results.push({ url: href, title });
+          }
+        }
+      });
+    }
+    console.log(`[BrowserSearch] Found ${results.length} result(s)`);
+    return results;
+  } catch (err) {
+    console.error(`[BrowserSearch] ${err.message}`);
+    return [];
+  }
+}
+
 // ── FaselHD Search ──
 
 async function searchFasel(query, year, type) {
@@ -1049,13 +1087,6 @@ async function extractStreamFromPlayer(playerUrl) {
 // ── Main resolver ──
 
 async function resolve(imdbId, type, season, episode) {
-  const cacheKey = `${imdbId}:${season || ""}:${episode || ""}`;
-  const cached = cacheGet(cache.stream, cacheKey, STREAM_TTL);
-  if (cached) {
-    console.log(`[Resolve] Cache hit for ${cacheKey}`);
-    return cached;
-  }
-
   console.log(`[Resolve] ${type} ${imdbId} S${season || "-"}E${episode || "-"}`);
 
   // Parallelize IMDB lookup and domain warm-up
@@ -1159,7 +1190,6 @@ async function resolve(imdbId, type, season, episode) {
   }
 
   console.log(`[Resolve] ${streams.length} stream(s)`);
-  if (streams.length > 0) cacheSet(cache.stream, cacheKey, streams);
   return streams;
 }
 
@@ -1371,7 +1401,7 @@ const server = http.createServer(async (req, res) => {
       nodeVersion: process.version,
       memoryMB: Math.round(process.memoryUsage().rss / 1048576),
       searchCache: cache.search.size,
-      streamCache: cache.stream.size,
+      searchCache: cache.search.size,
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(info, null, 2));
