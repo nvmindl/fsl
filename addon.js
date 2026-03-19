@@ -333,11 +333,11 @@ const MAIN_DOMAIN = "https://www.fasel-hd.cam";
 function isFaselUrl(url) { return url.includes(DOMAIN_BASE) || url.includes("fasel-hd.cam") || url.includes("faselhd."); }
 let activeDomain = process.env.FASELHDX_DOMAIN ? `https://${process.env.FASELHDX_DOMAIN.replace(/^https?:\/\//, "")}` : MAIN_DOMAIN;
 let domainLastCheck = process.env.FASELHDX_DOMAIN ? Date.now() : 0; // Skip discovery if domain provided
-const DOMAIN_TTL = 10 * 60 * 1000; // 10 min
+const DOMAIN_TTL = 5 * 60 * 1000; // 5 min — check more often since domains rotate fast
 let domainDiscoveryPromise = null;
 
 async function discoverDomain() {
-  // If we have a webXx domain, check if it's still alive
+  // 1. If we have a webXx domain, check if it's still alive (not redirecting)
   if (activeDomain !== MAIN_DOMAIN && activeDomain.includes(DOMAIN_BASE)) {
     try {
       const resp = await fetch(`${activeDomain}/`, {
@@ -350,12 +350,99 @@ async function discoverDomain() {
         domainLastCheck = Date.now();
         return activeDomain;
       }
+      // Domain is redirecting — check Location header for new domain
+      if (resp.status === 301 || resp.status === 302) {
+        const loc = resp.headers.get("location") || "";
+        console.log(`[Domain] Current domain redirecting to: ${loc}`);
+        const newDomain = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+        if (newDomain) {
+          activeDomain = newDomain[0].replace(/^http:/, "https:");
+          domainLastCheck = Date.now();
+          console.log(`[Domain] Followed redirect to: ${activeDomain}`);
+          return activeDomain;
+        }
+      }
     } catch {}
   }
 
-  console.log("[Domain] Discovering active domain via Puppeteer...");
+  // 2. Try swapping TLD (.xyz ↔ .best) with same number — often one TLD dies but the other works
+  const numMatch = activeDomain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
+  if (numMatch) {
+    const num = numMatch[1];
+    const currentTld = numMatch[2];
+    const otherTlds = ['best', 'xyz'].filter(t => t !== currentTld);
+    for (const tld of otherTlds) {
+      const tryDomain = `https://web${num}x.${DOMAIN_BASE}.${tld}`;
+      try {
+        const resp = await fetch(`${tryDomain}/`, {
+          redirect: "manual",
+          headers: { "User-Agent": UA },
+          signal: AbortSignal.timeout(4000),
+        });
+        if (resp.status === 200) {
+          activeDomain = tryDomain;
+          domainLastCheck = Date.now();
+          console.log(`[Domain] TLD swap found: ${activeDomain}`);
+          return activeDomain;
+        }
+      } catch {}
+    }
+  }
 
-  // Use Puppeteer to visit fasel-hd.cam — it goes through CF and lands on active domain
+  // 3. Quick scan — try nearby numbers on both TLDs
+  const lastNum = numMatch ? parseInt(numMatch[1]) : 31912;
+  console.log(`[Domain] Scanning from ${lastNum}...`);
+
+  // Scan in batches: close range first, then wider
+  const ranges = [
+    { start: -5, end: 5 },      // immediate neighbors
+    { start: 6, end: 50 },       // near range
+    { start: 51, end: 300 },     // wider range
+    { start: -50, end: -6 },     // older numbers
+  ];
+
+  for (const range of ranges) {
+    const batch = [];
+    for (let offset = range.start; offset <= range.end; offset++) {
+      for (const tld of ['best', 'xyz']) {
+        batch.push(`https://web${lastNum + offset}x.${DOMAIN_BASE}.${tld}`);
+      }
+    }
+
+    const results = await Promise.all(
+      batch.map(async (domain) => {
+        try {
+          const resp = await fetch(`${domain}/`, {
+            redirect: "manual",
+            headers: { "User-Agent": UA },
+            signal: AbortSignal.timeout(3000),
+          });
+          if (resp.status === 200) return domain;
+          // Also check if redirect points to a new working domain
+          if (resp.status === 301 || resp.status === 302) {
+            const loc = resp.headers.get("location") || "";
+            const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+            if (m) return m[0].replace(/^http:/, "https:");
+          }
+        } catch {}
+        return null;
+      })
+    );
+
+    const found = results.find(Boolean);
+    if (found) {
+      activeDomain = found;
+      domainLastCheck = Date.now();
+      // Clear page cache since domain changed
+      cache.page.clear();
+      cache.search.clear();
+      console.log(`[Domain] Discovered via scan: ${activeDomain}`);
+      return activeDomain;
+    }
+  }
+
+  // 4. Puppeteer fallback — visit main domain through CF
+  console.log("[Domain] Scan failed, trying Puppeteer...");
   try {
     const browser = await getBrowser();
     const page = await browser.newPage();
@@ -363,7 +450,6 @@ async function discoverDomain() {
       await page.setUserAgent(UA);
       await page.goto(MAIN_DOMAIN, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-      // Wait for CF challenge if present
       const content = await page.content();
       if (content.includes("Just a moment") || content.includes("Checking your browser")) {
         console.log("[Domain] CF challenge, waiting...");
@@ -376,30 +462,24 @@ async function discoverDomain() {
       const finalUrl = page.url();
       console.log(`[Domain] Browser landed on: ${finalUrl}`);
 
-      // Extract the domain from the final URL
       const m = finalUrl.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
       if (m) {
         activeDomain = m[0].replace(/^http:/, "https:");
         domainLastCheck = Date.now();
+        cache.page.clear();
+        cache.search.clear();
         console.log(`[Domain] Discovered: ${activeDomain}`);
         return activeDomain;
       }
 
-      // Maybe it stayed on fasel-hd.cam — check if page links contain webXx
       const html = await page.content();
       const linkMatch = html.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
       if (linkMatch) {
         activeDomain = linkMatch[0].replace(/^http:/, "https:");
         domainLastCheck = Date.now();
+        cache.page.clear();
+        cache.search.clear();
         console.log(`[Domain] Discovered from page links: ${activeDomain}`);
-        return activeDomain;
-      }
-
-      // Site might now run directly on fasel-hd.cam
-      if (finalUrl.includes("fasel-hd.cam") && html.length > 5000 && !html.includes("Just a moment")) {
-        activeDomain = MAIN_DOMAIN;
-        domainLastCheck = Date.now();
-        console.log(`[Domain] Site running directly on ${MAIN_DOMAIN}`);
         return activeDomain;
       }
     } finally {
@@ -407,44 +487,6 @@ async function discoverDomain() {
     }
   } catch (e) {
     console.log(`[Domain] Puppeteer discovery failed: ${e.message}`);
-  }
-
-  // After discovery, pre-warm worker page for content fetches
-  try { await ensureWorkerPage(); } catch {}
-
-  // FALLBACK: Quick parallel scan of nearby numbers
-  console.log("[Domain] Puppeteer failed, scanning...");
-  const numMatch = activeDomain.match(/web(\d+)x/);
-  const lastNum = numMatch ? parseInt(numMatch[1]) : 31718;
-
-  const candidates = [];
-  for (let offset = -10; offset <= 200; offset++) {
-    for (const tld of ['best', 'xyz']) {
-      candidates.push(`https://web${lastNum + offset}x.${DOMAIN_BASE}.${tld}`);
-    }
-  }
-  console.log(`[Domain] Scanning ${candidates.length} candidates...`);
-
-  const scanResults = await Promise.all(
-    candidates.map(async (domain) => {
-      try {
-        const resp = await fetch(`${domain}/`, {
-          redirect: "manual",
-          headers: { "User-Agent": UA },
-          signal: AbortSignal.timeout(3000),
-        });
-        if (resp.status === 200) return domain;
-      } catch {}
-      return null;
-    })
-  );
-
-  const found = scanResults.find(Boolean);
-  if (found) {
-    activeDomain = found;
-    domainLastCheck = Date.now();
-    console.log(`[Domain] Discovered via scan: ${activeDomain}`);
-    return activeDomain;
   }
 
   console.log("[Domain] Could not discover, using last known");
@@ -473,6 +515,8 @@ function learnDomainFromUrl(url) {
   try {
     const u = new URL(url);
     const origin = u.origin;
+    // Don't learn CF-protected main domains
+    if (u.hostname.includes("fasel-hd.cam") || u.hostname.includes("faselhd.")) return;
     if (isFaselUrl(origin) && origin !== activeDomain) {
       console.log(`[Domain] Learned working domain from redirect: ${origin}`);
       activeDomain = origin;
@@ -530,12 +574,41 @@ async function fetchPage(url, retries = 2) {
             signal: AbortSignal.timeout(12000),
           });
           if (resp.ok) {
-            learnDomainFromUrl(resp.url);
-            const text = await resp.text();
-            if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
-              console.log(`[Fetch] HTTP follow-redirect OK (${text.length} chars)`);
-              cacheSet(cache.page, url, text);
-              return text;
+            // Check if we got redirected to a dead/CF domain
+            const finalHost = new URL(resp.url).hostname;
+            if (finalHost.includes("fasel-hd.cam")) {
+              console.log(`[Fetch] Redirected to CF-protected ${finalHost}, re-discovering domain...`);
+              markDomainBad();
+              const newDomain = await getDomain();
+              // Rewrite URL to new domain and retry
+              if (newDomain !== MAIN_DOMAIN) {
+                const newUrl = url.replace(/https?:\/\/[^/]+/, newDomain);
+                if (newUrl !== url) {
+                  console.log(`[Fetch] Retrying with new domain: ${newUrl}`);
+                  const retryResp = await fetch(newUrl, {
+                    headers: { ...HEADERS, Referer: newUrl },
+                    redirect: "follow",
+                    signal: AbortSignal.timeout(12000),
+                  });
+                  if (retryResp.ok) {
+                    learnDomainFromUrl(retryResp.url);
+                    const retryText = await retryResp.text();
+                    if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
+                      console.log(`[Fetch] Retry OK (${retryText.length} chars)`);
+                      cacheSet(cache.page, newUrl, retryText);
+                      return retryText;
+                    }
+                  }
+                }
+              }
+            } else {
+              learnDomainFromUrl(resp.url);
+              const text = await resp.text();
+              if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
+                console.log(`[Fetch] HTTP follow-redirect OK (${text.length} chars)`);
+                cacheSet(cache.page, url, text);
+                return text;
+              }
             }
           }
         } catch {}
@@ -690,6 +763,30 @@ async function searchWebsite(query, domain) {
     });
     if (!resp.ok) {
       console.log(`[WebSearch] HTTP ${resp.status}`);
+      return [];
+    }
+    // Check if we got redirected to CF-protected domain
+    const finalHost = new URL(resp.url).hostname;
+    if (finalHost.includes("fasel-hd.cam")) {
+      console.log(`[WebSearch] Redirected to CF-protected ${finalHost}, re-discovering...`);
+      markDomainBad();
+      const newDomain = await getDomain();
+      if (newDomain !== MAIN_DOMAIN) {
+        const retryUrl = `${newDomain}/?s=${encodeURIComponent(query)}`;
+        console.log(`[WebSearch] Retrying: ${retryUrl}`);
+        const retryResp = await fetch(retryUrl, {
+          headers: { ...HEADERS },
+          redirect: "follow",
+          signal: AbortSignal.timeout(15000),
+        });
+        if (retryResp.ok) {
+          learnDomainFromUrl(retryResp.url);
+          const html = await retryResp.text();
+          if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
+            return parseSearchResults(html);
+          }
+        }
+      }
       return [];
     }
     // Learn working domain from redirect target
