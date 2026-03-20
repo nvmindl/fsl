@@ -1399,8 +1399,8 @@ async function resolve(imdbId, type, season, episode) {
     queries.push(parts[0].trim()); // main title before colon/dash (e.g. "Peaky Blinders")
   }
   queries.push(info.title); // full original title
-  // Strip special characters
-  const cleaned = info.title.replace(/[''`:;,!?]/g, "").replace(/\s+/g, " ").trim();
+  // Strip special characters (including periods — e.g. "The O.C." → "The OC")
+  const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
   if (cleaned !== info.title && !queries.includes(cleaned)) queries.push(cleaned);
   if (parts.length > 1) {
     const subtitle = parts[parts.length - 1].trim();
@@ -1963,6 +1963,7 @@ const server = http.createServer(async (req, res) => {
       try {
         await streamsResolving[streamsCacheKey];
       } catch {}
+      if (res.headersSent) return;
       const cached2 = cacheGet(cache.streams, streamsCacheKey, STREAMS_TTL);
       if (cached2) {
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -2028,12 +2029,16 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const jsonBody = await streamsResolving[streamsCacheKey];
-      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(jsonBody);
+      if (!res.headersSent) {
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(jsonBody);
+      }
     } catch (err) {
       console.error(`[Streams] Error: ${err.message}`);
-      res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ streams: [] }));
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ streams: [] }));
+      }
     }
     return;
   }
