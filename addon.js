@@ -585,12 +585,38 @@ async function fetchPage(url, retries = 2) {
 
         // Try plain HTTP with redirect following (works on non-CF subdomains)
         try {
+          // Use manual redirect for ?p= shortlinks to intercept CF-domain redirects
+          const isShortlink = /[?&]p=\d+/.test(url);
           const resp = await fetch(url, {
             headers: { ...HEADERS, Referer: url },
-            redirect: "follow",
+            redirect: isShortlink ? "manual" : "follow",
             signal: AbortSignal.timeout(12000),
           });
-          if (resp.ok) {
+          if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
+            // Shortlink redirect — rewrite target to working domain (don't mark domain bad)
+            const location = resp.headers.get("location");
+            if (location) {
+              const redirectPath = new URL(location, url).pathname + new URL(location, url).search;
+              const domain = activeDomain || MAIN_DOMAIN;
+              const rewrittenUrl = `${domain}${redirectPath}`;
+              console.log(`[Fetch] Shortlink redirect → rewriting to ${rewrittenUrl}`);
+              // Fetch the rewritten URL with redirect follow
+              const retryResp = await fetch(rewrittenUrl, {
+                headers: { ...HEADERS, Referer: rewrittenUrl },
+                redirect: "follow",
+                signal: AbortSignal.timeout(12000),
+              });
+              if (retryResp.ok) {
+                learnDomainFromUrl(retryResp.url);
+                const retryText = await retryResp.text();
+                if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
+                  console.log(`[Fetch] Shortlink rewrite OK (${retryText.length} chars)`);
+                  cacheSet(cache.page, url, retryText);
+                  return retryText;
+                }
+              }
+            }
+          } else if (resp.ok) {
             // Check if we got redirected to a dead/CF domain
             const finalHost = new URL(resp.url).hostname;
             if (finalHost.includes("fasel-hd.cam")) {
@@ -1423,11 +1449,13 @@ async function resolve(imdbId, type, season, episode) {
     const ep = parseInt(episode);
 
     // For anime/shows with separate entries per season, pick the right one
+    let pickedFromSearch = false;
     if (results.length > 1) {
       const seasonResult = pickSeasonResult(results, sn);
       if (seasonResult) {
         console.log(`[Resolve] Matched season ${sn} from search results: ${seasonResult.url}`);
         targetUrl = seasonResult.url;
+        pickedFromSearch = true;
       }
     }
 
@@ -1445,8 +1473,9 @@ async function resolve(imdbId, type, season, episode) {
       } else {
         console.log(`[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`);
       }
-    } else if (seasons.length > 1) {
+    } else if (seasons.length > 1 && !pickedFromSearch) {
       // Episodes shown but check if we're on the right season
+      // Skip if we already picked the correct season page from search results
       const match = seasons.find((s) => s.num === sn);
       if (match) {
         // Check if the current page is already for this season
@@ -1458,6 +1487,8 @@ async function resolve(imdbId, type, season, episode) {
           if (seasonPage.episodes.length > 0) episodes = seasonPage.episodes;
         }
       }
+    } else if (pickedFromSearch && episodes.length > 0) {
+      console.log(`[Resolve] Using ${episodes.length} episodes from search-matched season page`);
     }
 
     // Find the specific episode
