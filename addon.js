@@ -388,7 +388,7 @@ async function discoverDomain() {
   if (numMatch) {
     const num = numMatch[1];
     const tld = numMatch[2];
-    for (const t of ['best', 'xyz']) {
+    for (const t of ['best', 'xyz', 'top']) {
       const d = `https://web${num}x.${DOMAIN_BASE}.${t}`;
       if (d !== activeDomain) quickCandidates.push(d);
     }
@@ -418,7 +418,7 @@ async function discoverDomain() {
     for (const sign of [1, -1]) {
       const n = lastNum + d * sign;
       if (n < 1) continue;
-      for (const tld of ['best', 'xyz']) {
+      for (const tld of ['best', 'xyz', 'top']) {
         allCandidates.push(`https://web${n}x.${DOMAIN_BASE}.${tld}`);
       }
     }
@@ -1402,6 +1402,9 @@ async function resolve(imdbId, type, season, episode) {
   // Strip special characters (including periods — e.g. "The O.C." → "The OC")
   const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
   if (cleaned !== info.title && !queries.includes(cleaned)) queries.push(cleaned);
+  // Strip leading "The " — FaselHD often omits it (e.g. "The O.C." → "OC")
+  const noThe = cleaned.replace(/^the\s+/i, "").trim();
+  if (noThe && noThe !== cleaned && !queries.includes(noThe)) queries.push(noThe);
   if (parts.length > 1) {
     const subtitle = parts[parts.length - 1].trim();
     if (!queries.includes(subtitle)) queries.push(subtitle); // subtitle
@@ -1686,7 +1689,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Only allow proxying to known CDN domains
-    const allowed = ['scdns.io', 'faselhdx.best', 'faselhdx.xyz', 'fasel-hd.cam', 'faselhd.club'];
+    const allowed = ['scdns.io', 'faselhdx.best', 'faselhdx.xyz', 'faselhdx.top', 'fasel-hd.cam', 'faselhd.club'];
     let hostname;
     try { hostname = new URL(targetUrl).hostname; } catch { hostname = ''; }
     if (!allowed.some(d => hostname.endsWith(d))) {
