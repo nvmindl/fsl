@@ -1369,6 +1369,46 @@ async function parseMasterPlaylist(masterUrl) {
   }
 }
 
+// Filter search results by relevance to the actual title
+function filterResultsByRelevance(results, title, year) {
+  if (results.length <= 1) return results;
+
+  // Build slug variants of the title to match against URLs
+  const titleSlug = slugify(title); // e.g. "the-oc"
+  const cleanedSlug = slugify(title.replace(/[.]/g, "")); // e.g. "the-oc"
+  const noTheSlug = slugify(title.replace(/^the\s+/i, "").replace(/[.]/g, "")); // e.g. "oc"
+  const words = titleSlug.split("-").filter(w => w.length > 1); // significant words
+
+  const scored = results.map(r => {
+    const decoded = decodeURIComponent(r.url).toLowerCase();
+    let score = 0;
+
+    // Exact slug match in URL (strongest signal)
+    if (decoded.includes(titleSlug)) score += 100;
+    if (cleanedSlug !== titleSlug && decoded.includes(cleanedSlug)) score += 90;
+    if (noTheSlug !== cleanedSlug && decoded.includes(noTheSlug)) score += 80;
+
+    // Year match
+    if (year && decoded.includes(String(year))) score += 20;
+
+    // Individual word matches (weaker)
+    for (const w of words) {
+      if (decoded.includes(w)) score += 5;
+    }
+
+    return { ...r, score };
+  });
+
+  // Only keep results with score > 0 (at least some relevance)
+  const relevant = scored.filter(r => r.score > 0);
+  if (relevant.length === 0) return results; // fallback to unfiltered if nothing matches
+
+  // Sort by score descending
+  relevant.sort((a, b) => b.score - a.score);
+  console.log(`[Filter] ${results.length} → ${relevant.length} relevant (top: ${decodeURIComponent(relevant[0].url).substring(relevant[0].url.lastIndexOf("/") + 1, relevant[0].url.lastIndexOf("/") + 60)} score=${relevant[0].score})`);
+  return relevant;
+}
+
 // ── Main resolver ──
 
 async function resolve(imdbId, type, season, episode) {
@@ -1413,10 +1453,16 @@ async function resolve(imdbId, type, season, episode) {
   let results = [];
   for (const q of queries) {
     results = await searchFasel(q, info.year, type);
-    if (results.length > 0) break;
+    if (results.length > 0) {
+      results = filterResultsByRelevance(results, info.title, info.year);
+      if (results.length > 0) break;
+    }
     if (info.year) {
       results = await searchFasel(`${q} ${info.year}`, info.year, type);
-      if (results.length > 0) break;
+      if (results.length > 0) {
+        results = filterResultsByRelevance(results, info.title, info.year);
+        if (results.length > 0) break;
+      }
     }
   }
 
