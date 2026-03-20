@@ -1442,9 +1442,15 @@ async function resolve(imdbId, type, season, episode) {
   // Strip special characters (including periods — e.g. "The O.C." → "The OC")
   const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
   if (cleaned !== info.title && !queries.includes(cleaned)) queries.push(cleaned);
+  // Try periods → spaces (e.g. "The O.C." → "The O C" → search matches "o-c" slug)
+  const spaceDots = info.title.replace(/\./g, " ").replace(/\s+/g, " ").trim();
+  if (spaceDots !== info.title && !queries.includes(spaceDots)) queries.push(spaceDots);
   // Strip leading "The " — FaselHD often omits it (e.g. "The O.C." → "OC")
   const noThe = cleaned.replace(/^the\s+/i, "").trim();
   if (noThe && noThe !== cleaned && !queries.includes(noThe)) queries.push(noThe);
+  // Also try noThe with dots→spaces (e.g. "O C")
+  const noTheDots = spaceDots.replace(/^the\s+/i, "").trim();
+  if (noTheDots && noTheDots !== noThe && !queries.includes(noTheDots)) queries.push(noTheDots);
   if (parts.length > 1) {
     const subtitle = parts[parts.length - 1].trim();
     if (!queries.includes(subtitle)) queries.push(subtitle); // subtitle
@@ -1888,8 +1894,10 @@ const server = http.createServer(async (req, res) => {
 
     const session = playCache[sessionKey];
     if (!session) {
-      res.writeHead(503, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
-      res.end("Stream not available");
+      if (!res.headersSent) {
+        res.writeHead(503, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+        res.end("Stream not available");
+      }
       return;
     }
 
@@ -1910,20 +1918,24 @@ const server = http.createServer(async (req, res) => {
           // Serve stale if refresh fails — better than nothing
         }
       }
-      res.writeHead(200, {
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "no-cache",
-      });
-      res.end(session.m3u8);
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-cache",
+        });
+        res.end(session.m3u8);
+      }
       return;
     }
 
     // Segment request
     const segIdx = parseInt(pSegNum);
     if (segIdx >= session.segments.length) {
-      res.writeHead(404, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
-      res.end("Segment not found");
+      if (!res.headersSent) {
+        res.writeHead(404, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+        res.end("Segment not found");
+      }
       return;
     }
 
@@ -1959,8 +1971,10 @@ const server = http.createServer(async (req, res) => {
       if (!upstream.ok) {
         // Return 503 instead of 403 so ExoPlayer may retry
         const code = upstream.status === 403 ? 503 : upstream.status;
-        res.writeHead(code, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
-        res.end(`Upstream: ${upstream.status}`);
+        if (!res.headersSent) {
+          res.writeHead(code, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+          res.end(`Upstream: ${upstream.status}`);
+        }
         return;
       }
       const headers = {
