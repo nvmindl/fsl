@@ -1522,6 +1522,8 @@ const http = require("http");
 // Play session cache for /play/ endpoint
 const playCache = {};
 const playResolving = {};
+// Dedup concurrent /streams/ requests — second request waits for first
+const streamsResolving = {};
 // Clean up expired sessions every 5 minutes (sessions live 30 min)
 setInterval(() => {
   const now = Date.now();
@@ -1861,17 +1863,33 @@ const server = http.createServer(async (req, res) => {
     const season = parts[1] || null;
     const episode = parts[2] || null;
 
-    try {
-      // Check /streams/ response cache first
-      const streamsCacheKey = `${sType}/${sId}`;
-      const cachedStreams = cacheGet(cache.streams, streamsCacheKey, STREAMS_TTL);
-      if (cachedStreams) {
-        console.log(`[Streams] Cache hit: ${streamsCacheKey}`);
+    const streamsCacheKey = `${sType}/${sId}`;
+
+    // Check /streams/ response cache first
+    const cachedStreams = cacheGet(cache.streams, streamsCacheKey, STREAMS_TTL);
+    if (cachedStreams) {
+      console.log(`[Streams] Cache hit: ${streamsCacheKey}`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(cachedStreams);
+      return;
+    }
+
+    // Dedup: if another request is already resolving this, wait for it
+    if (streamsResolving[streamsCacheKey]) {
+      console.log(`[Streams] Waiting for in-flight: ${streamsCacheKey}`);
+      try {
+        await streamsResolving[streamsCacheKey];
+      } catch {}
+      const cached2 = cacheGet(cache.streams, streamsCacheKey, STREAMS_TTL);
+      if (cached2) {
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(cachedStreams);
+        res.end(cached2);
         return;
       }
+    }
 
+    // This request owns the resolution
+    streamsResolving[streamsCacheKey] = (async () => {
       console.log(`[Streams] ${sType} ${sId}`);
       const raw = await resolve(imdbId, sType, season, episode);
       const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
@@ -1903,7 +1921,6 @@ const server = http.createServer(async (req, res) => {
         const sessionKey = `${sType}/${sId}/${qi}`;
         if (!playCache[sessionKey]) {
           const variantUrl = v.url;
-          // Fire and forget — don't block the response
           fetchSegments(variantUrl).then(fresh => {
             playCache[sessionKey] = {
               variantUrl,
@@ -1921,6 +1938,13 @@ const server = http.createServer(async (req, res) => {
 
       const jsonBody = JSON.stringify({ streams });
       if (streams.length > 0) cacheSet(cache.streams, streamsCacheKey, jsonBody);
+      return jsonBody;
+    })().finally(() => {
+      delete streamsResolving[streamsCacheKey];
+    });
+
+    try {
+      const jsonBody = await streamsResolving[streamsCacheKey];
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(jsonBody);
     } catch (err) {
