@@ -1856,26 +1856,44 @@ const server = http.createServer(async (req, res) => {
       const raw = await resolve(imdbId, sType, season, episode);
       const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 
-      const streams = [];
-      let qualityIdx = 0;
+      // Collect all variants with their CDN URLs
+      const allVariants = [];
       for (const s of raw) {
         const variants = await parseMasterPlaylist(s.url);
         if (variants && variants.length > 0) {
           for (const v of variants) {
-            streams.push({
-              name: "FaselHD",
-              title: [v.label, s.title].filter(Boolean).join(" | "),
-              url: `${proxyBase}/play/${sType}/${sId}/${qualityIdx}/master.m3u8`,
-            });
-            qualityIdx++;
+            allVariants.push({ url: v.url, label: v.label, title: s.title });
           }
         } else {
-          streams.push({
-            name: "FaselHD",
-            title: s.title || "FaselHD",
-            url: `${proxyBase}/play/${sType}/${sId}/${qualityIdx}/master.m3u8`,
+          allVariants.push({ url: s.url, label: "auto", title: s.title });
+        }
+      }
+
+      // Pre-cache play sessions in background — so /play/ serves instantly
+      const streams = [];
+      for (let qi = 0; qi < allVariants.length; qi++) {
+        const v = allVariants[qi];
+        streams.push({
+          name: "FaselHD",
+          title: [v.label, v.title].filter(Boolean).join(" | "),
+          url: `${proxyBase}/play/${sType}/${sId}/${qi}/master.m3u8`,
+        });
+        const sessionKey = `${sType}/${sId}/${qi}`;
+        if (!playCache[sessionKey]) {
+          const variantUrl = v.url;
+          // Fire and forget — don't block the response
+          fetchSegments(variantUrl).then(fresh => {
+            playCache[sessionKey] = {
+              variantUrl,
+              m3u8: fresh.m3u8,
+              segments: fresh.segments,
+              created: Date.now(),
+              segmentsFetched: Date.now(),
+            };
+            console.log(`[Streams] Pre-cached: ${sessionKey} (${fresh.segments.length} segments)`);
+          }).catch(err => {
+            console.error(`[Streams] Pre-cache failed for ${sessionKey}: ${err.message}`);
           });
-          qualityIdx++;
         }
       }
 
