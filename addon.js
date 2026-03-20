@@ -932,10 +932,8 @@ async function searchFasel(query, year, type) {
     }
   }
 
-  // Strategy 3: Browser-based search (Puppeteer, last resort)
-  if (!results.length) {
-    results = await searchViaBrowser(query, domain);
-  }
+  // NO browser fallback here — it's too slow per-query.
+  // Browser search is only used as final fallback in resolve() with the best query.
 
   // Filter by type
   if (results.length > 0) {
@@ -1368,15 +1366,19 @@ async function resolve(imdbId, type, season, episode) {
   console.log(`[Resolve] "${info.title}" (${info.year})`);
 
   // Build search queries — FaselHD struggles with special chars like apostrophes/colons
-  const queries = [info.title];
-  // Strip special characters
-  const cleaned = info.title.replace(/[''`:;,!?]/g, "").replace(/\s+/g, " ").trim();
-  if (cleaned !== info.title) queries.push(cleaned);
-  // If title has a colon/dash subtitle, try both parts
+  // Order: main title first (most likely to match), then full, then cleaned, then subtitle
+  const queries = [];
   const parts = info.title.split(/[:\-–—]\s*/);
   if (parts.length > 1) {
-    queries.push(parts[parts.length - 1].trim()); // subtitle
-    queries.push(parts[0].trim()); // main title
+    queries.push(parts[0].trim()); // main title before colon/dash (e.g. "Peaky Blinders")
+  }
+  queries.push(info.title); // full original title
+  // Strip special characters
+  const cleaned = info.title.replace(/[''`:;,!?]/g, "").replace(/\s+/g, " ").trim();
+  if (cleaned !== info.title && !queries.includes(cleaned)) queries.push(cleaned);
+  if (parts.length > 1) {
+    const subtitle = parts[parts.length - 1].trim();
+    if (!queries.includes(subtitle)) queries.push(subtitle); // subtitle
   }
 
   let results = [];
@@ -1388,6 +1390,25 @@ async function resolve(imdbId, type, season, episode) {
       if (results.length > 0) break;
     }
   }
+
+  // Final fallback: browser search with the main title (only if everything else failed)
+  if (results.length === 0) {
+    const domain = await getDomain();
+    const bestQuery = parts.length > 1 ? parts[0].trim() : info.title;
+    console.log(`[Resolve] All HTTP searches failed, browser fallback: "${bestQuery}"`);
+    results = await searchViaBrowser(bestQuery, domain);
+    // Filter by type
+    if (results.length > 0) {
+      if (type === "movie") {
+        const f = results.filter(r => r.url.includes("/movies/"));
+        if (f.length) results = f;
+      } else if (type === "series") {
+        const f = results.filter(r => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/"));
+        if (f.length) results = f;
+      }
+    }
+  }
+
   if (results.length === 0) {
     console.log("[Resolve] Nothing found on FaselHD");
     return [];
