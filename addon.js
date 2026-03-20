@@ -309,9 +309,13 @@ const cache = {
   imdb: new Map(),    // imdbId → { title, year, ts }
   search: new Map(),  // "query|year" → { results, ts }
   page: new Map(),    // url → { html, ts } — short-lived, avoids re-fetching same URL
+  resolve: new Map(), // "type/imdbId:s:e" → { streams[], ts }
+  streams: new Map(), // "type/imdbId:s:e" → { json, ts } — /streams/ response cache
 };
 const IMDB_TTL = 24 * 60 * 60 * 1000;   // 24h
 const SEARCH_TTL = 15 * 60 * 1000;        // 15min
+const RESOLVE_TTL = 10 * 60 * 1000;       // 10min
+const STREAMS_TTL = 5 * 60 * 1000;        // 5min
 
 function cacheGet(store, key, ttl) {
   const entry = store.get(key);
@@ -1313,6 +1317,12 @@ async function parseMasterPlaylist(masterUrl) {
 // ── Main resolver ──
 
 async function resolve(imdbId, type, season, episode) {
+  const resolveKey = `${type}/${imdbId}:${season || ""}:${episode || ""}`;
+  const cachedResolve = cacheGet(cache.resolve, resolveKey, RESOLVE_TTL);
+  if (cachedResolve) {
+    console.log(`[Resolve] Cache hit: ${resolveKey} (${cachedResolve.length} streams)`);
+    return cachedResolve;
+  }
   console.log(`[Resolve] ${type} ${imdbId} S${season || "-"}E${episode || "-"}`);
 
   // Parallelize IMDB lookup and domain discovery
@@ -1418,16 +1428,16 @@ async function resolve(imdbId, type, season, episode) {
   // Get player_token URLs from the page
   const players = await getPlayerTokens(targetUrl);
 
-  // Extract streams from all servers
-  for (const p of players) {
-    const s = await extractStreamFromPlayer(p.url);
-    if (s) {
-      const serverInfo = [p.quality, p.name].filter(Boolean).join(" | ") || "FaselHD";
-      streams.push({ url: s.url, title: serverInfo });
-    }
+  // Extract streams from all servers IN PARALLEL
+  const extractions = await Promise.allSettled(
+    players.map(p => extractStreamFromPlayer(p.url).then(s => s ? { url: s.url, title: [p.quality, p.name].filter(Boolean).join(" | ") || "FaselHD" } : null))
+  );
+  for (const r of extractions) {
+    if (r.status === "fulfilled" && r.value) streams.push(r.value);
   }
 
   console.log(`[Resolve] ${streams.length} stream(s)`);
+  if (streams.length > 0) cacheSet(cache.resolve, resolveKey, streams);
   return streams;
 }
 
@@ -1852,20 +1862,32 @@ const server = http.createServer(async (req, res) => {
     const episode = parts[2] || null;
 
     try {
+      // Check /streams/ response cache first
+      const streamsCacheKey = `${sType}/${sId}`;
+      const cachedStreams = cacheGet(cache.streams, streamsCacheKey, STREAMS_TTL);
+      if (cachedStreams) {
+        console.log(`[Streams] Cache hit: ${streamsCacheKey}`);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(cachedStreams);
+        return;
+      }
+
       console.log(`[Streams] ${sType} ${sId}`);
       const raw = await resolve(imdbId, sType, season, episode);
       const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 
-      // Collect all variants with their CDN URLs
+      // Collect all variants — parse master playlists IN PARALLEL
+      const masterResults = await Promise.allSettled(
+        raw.map(s => parseMasterPlaylist(s.url).then(variants => ({ variants, title: s.title, url: s.url })))
+      );
       const allVariants = [];
-      for (const s of raw) {
-        const variants = await parseMasterPlaylist(s.url);
+      for (const r of masterResults) {
+        if (r.status !== "fulfilled") continue;
+        const { variants, title, url } = r.value;
         if (variants && variants.length > 0) {
-          for (const v of variants) {
-            allVariants.push({ url: v.url, label: v.label, title: s.title });
-          }
+          for (const v of variants) allVariants.push({ url: v.url, label: v.label, title });
         } else {
-          allVariants.push({ url: s.url, label: "auto", title: s.title });
+          allVariants.push({ url, label: "auto", title });
         }
       }
 
@@ -1897,8 +1919,10 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      const jsonBody = JSON.stringify({ streams });
+      if (streams.length > 0) cacheSet(cache.streams, streamsCacheKey, jsonBody);
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ streams }));
+      res.end(jsonBody);
     } catch (err) {
       console.error(`[Streams] Error: ${err.message}`);
       res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
