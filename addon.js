@@ -1523,6 +1523,33 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// Helper: fetch a variant m3u8 from CDN and parse segment URLs
+async function fetchSegments(variantUrl) {
+  const resp = await fetch(variantUrl, {
+    headers: { "User-Agent": UA },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!resp.ok) throw new Error(`CDN returned ${resp.status}`);
+  const body = await resp.text();
+  if (!body.includes("#EXTM3U")) throw new Error("Invalid m3u8");
+  const base = variantUrl.substring(0, variantUrl.lastIndexOf("/") + 1);
+  const segments = [];
+  const rewrittenLines = [];
+  let segIdx = 0;
+  for (const line of body.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      rewrittenLines.push(trimmed);
+      continue;
+    }
+    const absUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, base).href;
+    segments.push(absUrl);
+    rewrittenLines.push(`s/${segIdx}.ts`);
+    segIdx++;
+  }
+  return { m3u8: rewrittenLines.join("\n"), segments };
+}
+
 const server = http.createServer(async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -1698,44 +1725,13 @@ const server = http.createServer(async (req, res) => {
             if (qi >= allVariants.length) throw new Error("Quality index out of range");
             targetUrl = allVariants[qi].url;
 
-            // Fetch the actual m3u8 playlist from CDN
-            const m3u8Resp = await fetch(targetUrl, {
-              headers: { "User-Agent": UA },
-              signal: AbortSignal.timeout(15000),
-            });
-            if (!m3u8Resp.ok) throw new Error(`CDN returned ${m3u8Resp.status}`);
-            const m3u8Body = await m3u8Resp.text();
-            if (!m3u8Body.includes("#EXTM3U")) throw new Error("Invalid m3u8");
-
-            const m3u8Base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
-
-            // Parse segment URLs
-            const segments = [];
-            const lines = m3u8Body.split("\n");
-            const rewrittenLines = [];
-            let segIdx = 0;
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed.startsWith("#")) {
-                rewrittenLines.push(trimmed);
-                continue;
-              }
-              // This is a segment URL
-              let absUrl;
-              if (trimmed.startsWith("http")) {
-                absUrl = trimmed;
-              } else {
-                absUrl = new URL(trimmed, m3u8Base).href;
-              }
-              segments.push(absUrl);
-              rewrittenLines.push(`s/${segIdx}.ts`);
-              segIdx++;
-            }
-
+            const { m3u8, segments } = await fetchSegments(targetUrl);
             playCache[sessionKey] = {
-              m3u8: rewrittenLines.join("\n"),
+              variantUrl: targetUrl,
+              m3u8,
               segments,
               created: Date.now(),
+              segmentsFetched: Date.now(),
             };
           } catch (err) {
             console.error(`[Play] Resolve error: ${err.message}`);
@@ -1757,6 +1753,19 @@ const server = http.createServer(async (req, res) => {
     session.created = Date.now();
 
     if (pPath === "master.m3u8") {
+      // Proactively refresh segment URLs if older than 3 minutes
+      if (session.variantUrl && Date.now() - session.segmentsFetched > 3 * 60 * 1000) {
+        try {
+          console.log(`[Play] Refreshing stale segments: ${sessionKey}`);
+          const fresh = await fetchSegments(session.variantUrl);
+          session.m3u8 = fresh.m3u8;
+          session.segments = fresh.segments;
+          session.segmentsFetched = Date.now();
+        } catch (err) {
+          console.error(`[Play] Segment refresh failed: ${err.message}`);
+          // Serve stale if refresh fails — better than nothing
+        }
+      }
       res.writeHead(200, {
         "Content-Type": "application/vnd.apple.mpegurl",
         "Access-Control-Allow-Origin": "*",
@@ -1775,13 +1784,38 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const segUrl = session.segments[segIdx];
-      const upstream = await fetch(segUrl, {
+      let segUrl = session.segments[segIdx];
+      let upstream = await fetch(segUrl, {
         headers: { "User-Agent": UA },
         signal: AbortSignal.timeout(30000),
       });
+
+      // CDN 403 = expired tokens — refresh segment URLs and retry once
+      if (upstream.status === 403 && session.variantUrl) {
+        console.log(`[Play] CDN 403 on segment ${segIdx}, refreshing tokens...`);
+        try {
+          const fresh = await fetchSegments(session.variantUrl);
+          session.m3u8 = fresh.m3u8;
+          session.segments = fresh.segments;
+          session.segmentsFetched = Date.now();
+          if (segIdx < session.segments.length) {
+            segUrl = session.segments[segIdx];
+            upstream = await fetch(segUrl, {
+              headers: { "User-Agent": UA },
+              signal: AbortSignal.timeout(30000),
+            });
+          }
+        } catch (refreshErr) {
+          console.error(`[Play] Token refresh failed: ${refreshErr.message}`);
+          // Delete session so next m3u8 request triggers full re-resolution
+          delete playCache[sessionKey];
+        }
+      }
+
       if (!upstream.ok) {
-        res.writeHead(upstream.status, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+        // Return 503 instead of 403 so ExoPlayer may retry
+        const code = upstream.status === 403 ? 503 : upstream.status;
+        res.writeHead(code, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
         res.end(`Upstream: ${upstream.status}`);
         return;
       }
