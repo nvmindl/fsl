@@ -776,10 +776,31 @@ async function searchWebsite(query, domain) {
     const resp = await fetch(searchUrl, {
       headers: { ...HEADERS },
       redirect: "follow",
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(10000),
     });
     if (!resp.ok) {
       console.log(`[WebSearch] HTTP ${resp.status}`);
+      // On 403, mark domain bad and re-discover immediately
+      if (resp.status === 403 && isFaselUrl(domain)) {
+        markDomainBad();
+        const newDomain = await getDomain();
+        if (newDomain !== domain && newDomain !== MAIN_DOMAIN) {
+          console.log(`[WebSearch] Retrying on ${newDomain}`);
+          const retryUrl = `${newDomain}/?s=${encodeURIComponent(query)}`;
+          const retryResp = await fetch(retryUrl, {
+            headers: { ...HEADERS },
+            redirect: "follow",
+            signal: AbortSignal.timeout(10000),
+          });
+          if (retryResp.ok) {
+            learnDomainFromUrl(retryResp.url);
+            const html = await retryResp.text();
+            if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
+              return parseSearchResults(html);
+            }
+          }
+        }
+      }
       return [];
     }
     // Check if we got redirected to CF-protected domain
@@ -886,6 +907,16 @@ async function searchFasel(query, year, type) {
 
   // Strategy 1: Website search (fast HTTP, follows redirects, finds ALL content)
   results = await searchWebsite(query, domain);
+
+  // If website search failed, refresh domain — it may have been re-discovered
+  if (!results.length) {
+    const freshDomain = await getDomain();
+    if (freshDomain !== domain) {
+      console.log(`[Search] Domain changed to ${freshDomain}, retrying website search`);
+      domain = freshDomain;
+      results = await searchWebsite(query, domain);
+    }
+  }
 
   // Strategy 2: Sitemap search (fallback if website search fails)
   if (!results.length) {
@@ -1995,6 +2026,17 @@ server.listen(PORT, () => {
   console.log(`  Health:   http://localhost:${PORT}/health`);
   console.log(`  Test:     http://localhost:${PORT}/stream/movie/tt6166392.json`);
   console.log("=".repeat(55));
+
+  // Self-ping keepalive — prevents Render free tier cold starts
+  const selfUrl = process.env.RENDER_EXTERNAL_URL;
+  if (selfUrl) {
+    setInterval(() => {
+      fetch(`${selfUrl}/manifest.json`, { signal: AbortSignal.timeout(10000) })
+        .then(() => console.log("[Keepalive] ping OK"))
+        .catch(() => {});
+    }, 10 * 60 * 1000); // every 10 min
+    console.log(`  Keepalive: every 10min → ${selfUrl}`);
+  }
 });
 
 process.on("SIGINT", () => {
