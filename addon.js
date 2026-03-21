@@ -1724,8 +1724,15 @@ async function fetchSegments(variantUrl) {
 }
 
 const server = http.createServer(async (req, res) => {
-  // CORS
+  // CORS — support Range header for seek
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Range");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   // Global request timeout: 120s max per request
   const requestTimeout = setTimeout(() => {
@@ -1775,12 +1782,17 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const proxyBase = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+
+      // Forward Range header from client for seek support
+      const upHeaders = { "User-Agent": UA };
+      if (req.headers.range) upHeaders["Range"] = req.headers.range;
+
       const upstream = await fetch(targetUrl, {
-        headers: { "User-Agent": UA },
+        headers: upHeaders,
         signal: AbortSignal.timeout(30000),
       });
 
-      if (!upstream.ok) {
+      if (!upstream.ok && upstream.status !== 206) {
         res.writeHead(upstream.status, { "Content-Type": "text/plain" });
         res.end(`Upstream error: ${upstream.status}`);
         return;
@@ -1826,15 +1838,20 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // For .ts segments or other binary data, pipe through
+      // For .ts segments or other binary data, pipe through with seek support
       const headers = {
         "Content-Type": ct || "application/octet-stream",
         "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
       };
       const cl = upstream.headers.get("content-length");
       if (cl) headers["Content-Length"] = cl;
+      const cr = upstream.headers.get("content-range");
+      if (cr) headers["Content-Range"] = cr;
+      const statusCode = upstream.status; // 200 or 206
       if (res.headersSent) return;
-      res.writeHead(200, headers);
+      res.writeHead(statusCode, headers);
 
       // Stream the body
       const reader = upstream.body.getReader();
@@ -1965,8 +1982,10 @@ const server = http.createServer(async (req, res) => {
 
     try {
       let segUrl = session.segments[segIdx];
+      const segHeaders = { "User-Agent": UA };
+      if (req.headers.range) segHeaders["Range"] = req.headers.range;
       let upstream = await fetch(segUrl, {
-        headers: { "User-Agent": UA },
+        headers: segHeaders,
         signal: AbortSignal.timeout(30000),
       });
 
@@ -1980,8 +1999,10 @@ const server = http.createServer(async (req, res) => {
           session.segmentsFetched = Date.now();
           if (segIdx < session.segments.length) {
             segUrl = session.segments[segIdx];
+            const retryHeaders = { "User-Agent": UA };
+            if (req.headers.range) retryHeaders["Range"] = req.headers.range;
             upstream = await fetch(segUrl, {
-              headers: { "User-Agent": UA },
+              headers: retryHeaders,
               signal: AbortSignal.timeout(30000),
             });
           }
@@ -2004,11 +2025,16 @@ const server = http.createServer(async (req, res) => {
       const headers = {
         "Content-Type": upstream.headers.get("content-type") || "video/MP2T",
         "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
       };
       const cl = upstream.headers.get("content-length");
       if (cl) headers["Content-Length"] = cl;
+      const cr = upstream.headers.get("content-range");
+      if (cr) headers["Content-Range"] = cr;
+      const statusCode = upstream.status; // 200 or 206
       if (res.headersSent) return;
-      res.writeHead(200, headers);
+      res.writeHead(statusCode, headers);
       const reader = upstream.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
