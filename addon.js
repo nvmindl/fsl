@@ -743,7 +743,20 @@ async function getImdbInfo(imdbId) {
   return null;
 }
 
-// ── Sitemap-based search (bypasses CF-blocked /?s= endpoint) ──
+// Fetch season name from Cinemeta (e.g. "Stone Ocean" for JoJo S5)
+async function getSeasonName(imdbId, season) {
+  try {
+    const resp = await fetch(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const videos = data?.meta?.videos;
+    if (!videos) return null;
+    const ep1 = videos.find(v => v.season === season && v.episode === 1);
+    return ep1?.name || null;
+  } catch { return null; }
+}
 
 // ── Sitemap-based search (on-demand, low memory) ──
 // Instead of loading all sitemaps into memory, we search them one at a time
@@ -833,7 +846,7 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
 async function searchWebsite(query, domain) {
   try {
     // Strip special chars that break FaselHD AJAX (apostrophes, backticks, etc.)
-    const cleanQuery = query.replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
+    const cleanQuery = query.replace(/['']s\b/g, "").replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
     const ajaxUrl = `${domain}/wp-admin/admin-ajax.php`;
     console.log(`[WebSearch] POST ${ajaxUrl} trsearch="${cleanQuery}"`);
     const resp = await fetch(ajaxUrl, {
@@ -979,7 +992,7 @@ async function searchWebsite(query, domain) {
 async function searchViaBrowser(query, domain) {
   try {
     // Strip special chars that break FaselHD search 
-    const cleanQuery = query.replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
+    const cleanQuery = query.replace(/['']s\b/g, "").replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
     const searchUrl = `${domain}/search/${encodeURIComponent(cleanQuery)}`;
     console.log(`[BrowserSearch] ${searchUrl}`);
     const html = await fetchPage(searchUrl);
@@ -1568,9 +1581,9 @@ async function resolve(imdbId, type, season, episode) {
   const queries = [];
   const parts = info.title.split(/[:\-–—]\s*/);
   // Strip special characters first (most reliable for AJAX — e.g. "JoJo's" → "JoJos")
-  const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
+  const cleaned = info.title.replace(/['']s\b/g, "").replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
   if (parts.length > 1) {
-    const cleanedMain = parts[0].trim().replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
+    const cleanedMain = parts[0].trim().replace(/['']s\b/g, "").replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
     queries.push(cleanedMain); // cleaned main title before colon/dash
   }
   if (!queries.includes(cleaned)) queries.push(cleaned); // cleaned full title
@@ -1650,6 +1663,45 @@ async function resolve(imdbId, type, season, episode) {
         console.log(`[Resolve] Matched season ${sn} from search results: ${seasonResult.url}`);
         targetUrl = seasonResult.url;
         pickedFromSearch = true;
+      }
+    }
+
+    // Anime fallback: if results are separate entries (no season navigation on page)
+    // and the season name from Cinemeta differs from the matched result,
+    // try a supplementary search with the season name (e.g. "Stone Ocean" for JoJo S5)
+    if (pickedFromSearch && results.some(r => /\/anime\//.test(r.url))) {
+      const seasonName = await getSeasonName(imdbId, sn);
+      if (seasonName && seasonName.length > 2) {
+        const targetSlug = slugify(seasonName);
+        const pickedSlug = decodeURIComponent(targetUrl).toLowerCase();
+        if (!pickedSlug.includes(targetSlug)) {
+          console.log(`[Resolve] Season name "${seasonName}" not in picked URL, searching...`);
+          let nameResults = await searchFasel(seasonName, info.year, type);
+          if (nameResults.length > 0) {
+            nameResults = filterResultsByRelevance(nameResults, seasonName, info.year);
+            const animeHit = nameResults.find(r => /\/anime\//.test(r.url));
+            if (animeHit) {
+              console.log(`[Resolve] Found by season name: ${animeHit.url}`);
+              targetUrl = animeHit.url;
+            }
+          }
+        }
+      }
+    } else if (!pickedFromSearch && results.length > 0 && results.every(r => /\/anime\//.test(r.url))) {
+      // No season match at all from search results — try season name search
+      const seasonName = await getSeasonName(imdbId, sn);
+      if (seasonName && seasonName.length > 2) {
+        console.log(`[Resolve] No season match, trying season name: "${seasonName}"`);
+        let nameResults = await searchFasel(seasonName, null, type);
+        if (nameResults.length > 0) {
+          nameResults = filterResultsByRelevance(nameResults, seasonName, null);
+          const animeHit = nameResults.find(r => /\/anime\//.test(r.url));
+          if (animeHit) {
+            console.log(`[Resolve] Found by season name: ${animeHit.url}`);
+            targetUrl = animeHit.url;
+            pickedFromSearch = true;
+          }
+        }
       }
     }
 
@@ -2279,7 +2331,7 @@ const server = http.createServer(async (req, res) => {
     const chromiumExists = fs.existsSync(CHROME_PATH);
     const info = {
       status: "ok",
-      version: "2026-03-21d",
+      version: "2026-03-21e",
       domain: activeDomain,
       domainAge: Date.now() - domainLastCheck,
       browserConnected: browserInstance ? browserInstance.isConnected() : false,
