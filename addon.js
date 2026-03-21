@@ -2254,6 +2254,7 @@ const server = http.createServer(async (req, res) => {
     const chromiumExists = fs.existsSync(CHROME_PATH);
     const info = {
       status: "ok",
+      version: "2026-03-21b",
       domain: activeDomain,
       domainAge: Date.now() - domainLastCheck,
       browserConnected: browserInstance ? browserInstance.isConnected() : false,
@@ -2261,7 +2262,6 @@ const server = http.createServer(async (req, res) => {
       chromiumExists,
       nodeVersion: process.version,
       memoryMB: Math.round(process.memoryUsage().rss / 1048576),
-      searchCache: cache.search.size,
       searchCache: cache.search.size,
     };
     res.writeHead(200, { "Content-Type": "application/json" });
