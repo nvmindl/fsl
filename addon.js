@@ -491,13 +491,54 @@ async function discoverDomain() {
           ).catch(() => {});
         }
 
+        let foundDomain = null;
         const finalUrl = page.url();
-        const m = finalUrl.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-        if (m) return applyFound(m[0].replace(/^http:/, "https:"));
+        const m = finalUrl.match(/https?:\/\/web(\d+)x\.faselhdx\.([a-z]+)/);
+        if (m) foundDomain = m[0].replace(/^http:/, "https:");
 
-        const html = await page.content();
-        const linkMatch = html.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
-        if (linkMatch) return applyFound(linkMatch[0].replace(/^http:/, "https:"));
+        if (!foundDomain) {
+          const html = await page.content();
+          const linkMatch = html.match(/https?:\/\/web(\d+)x\.faselhdx\.([a-z]+)/);
+          if (linkMatch) foundDomain = linkMatch[0].replace(/^http:/, "https:");
+        }
+
+        if (foundDomain) {
+          // Puppeteer found a domain — verify search works, try alternate TLDs if not
+          const numM = foundDomain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
+          if (numM) {
+            const domNum = numM[1];
+            const foundTld = numM[2];
+            // Quick search test on the found domain
+            try {
+              const testResp = await fetch(`${foundDomain}/?s=test`, {
+                headers: { "User-Agent": UA },
+                redirect: "follow",
+                signal: AbortSignal.timeout(5000),
+              });
+              if (testResp.ok) return applyFound(foundDomain);
+            } catch {}
+            // Search failed — try same number with other TLDs
+            console.log(`[Domain] ${foundDomain} search blocked, trying alternate TLDs...`);
+            for (const tld of ['top', 'best', 'xyz']) {
+              if (tld === foundTld) continue;
+              const alt = `https://web${domNum}x.${DOMAIN_BASE}.${tld}`;
+              try {
+                const altResp = await fetch(`${alt}/?s=test`, {
+                  headers: { "User-Agent": UA },
+                  redirect: "follow",
+                  signal: AbortSignal.timeout(3000),
+                });
+                if (altResp.ok) {
+                  console.log(`[Domain] Alternate TLD works: ${alt}`);
+                  return applyFound(alt);
+                }
+              } catch {}
+            }
+            // No TLD has working search — use what Puppeteer found anyway
+            return applyFound(foundDomain);
+          }
+          return applyFound(foundDomain);
+        }
       } finally {
         await page.close().catch(() => {});
       }
@@ -824,6 +865,34 @@ async function searchWebsite(query, domain) {
             if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
               return parseSearchResults(html);
             }
+          }
+        }
+        // If rediscovered domain also fails, try alternate TLDs of the current domain number
+        const numM = (newDomain || domain).match(/web(\d+)x\.faselhdx\.([a-z]+)/);
+        if (numM) {
+          for (const tld of ['top', 'best', 'xyz']) {
+            if (tld === numM[2]) continue;
+            const altDomain = `https://web${numM[1]}x.${DOMAIN_BASE}.${tld}`;
+            try {
+              const altUrl = `${altDomain}/?s=${encodeURIComponent(query)}`;
+              console.log(`[WebSearch] Trying alt TLD: ${altUrl}`);
+              const altResp = await fetch(altUrl, {
+                headers: { ...HEADERS },
+                redirect: "follow",
+                signal: AbortSignal.timeout(8000),
+              });
+              if (altResp.ok) {
+                const altHtml = await altResp.text();
+                if (!altHtml.includes("Just a moment") && !altHtml.includes("Checking your browser")) {
+                  console.log(`[WebSearch] Alt TLD works: ${altDomain}`);
+                  // Update active domain to this working one
+                  activeDomain = altDomain;
+                  domainLastCheck = Date.now();
+                  cache.page.clear(); cache.search.clear();
+                  return parseSearchResults(altHtml);
+                }
+              }
+            } catch {}
           }
         }
       }
@@ -1810,6 +1879,7 @@ const server = http.createServer(async (req, res) => {
       };
       const cl = upstream.headers.get("content-length");
       if (cl) headers["Content-Length"] = cl;
+      if (res.headersSent) return;
       res.writeHead(200, headers);
 
       // Stream the body
@@ -1983,6 +2053,7 @@ const server = http.createServer(async (req, res) => {
       };
       const cl = upstream.headers.get("content-length");
       if (cl) headers["Content-Length"] = cl;
+      if (res.headersSent) return;
       res.writeHead(200, headers);
       const reader = upstream.body.getReader();
       while (true) {
