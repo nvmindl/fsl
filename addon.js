@@ -379,103 +379,38 @@ async function discoverDomain() {
     return domain;
   }
 
-  // ── Phase 1: Quick check current domain + TLD swap (parallel, <2s) ──
+  // ── Phase 1: Quick check current domain + TLD swap + main domain redirect (parallel, <3s) ──
   const numMatch = activeDomain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
   const quickCandidates = [];
+  // Always try the main domain — it redirects to the current working subdomain
+  quickCandidates.push(MAIN_DOMAIN);
   if (activeDomain !== MAIN_DOMAIN && activeDomain.includes(DOMAIN_BASE)) {
     quickCandidates.push(activeDomain);
   }
   if (numMatch) {
-    const num = numMatch[1];
-    const tld = numMatch[2];
     for (const t of ['best', 'xyz', 'top']) {
-      const d = `https://web${num}x.${DOMAIN_BASE}.${t}`;
+      const d = `https://web${numMatch[1]}x.${DOMAIN_BASE}.${t}`;
       if (d !== activeDomain) quickCandidates.push(d);
     }
   }
 
   if (quickCandidates.length) {
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 2000);
+    const timer = setTimeout(() => ac.abort(), 3000);
     try {
       const result = await Promise.any(
         quickCandidates.map(d => probe(d, ac).then(r => r || Promise.reject()))
       );
       clearTimeout(timer);
-      ac.abort(); // cancel remaining
+      ac.abort();
       return applyFound(result);
     } catch { clearTimeout(timer); }
   }
 
-  // ── Phase 2: Parallel scan ALL ranges at once, race for first hit (<8s) ──
-  const lastNum = numMatch ? parseInt(numMatch[1]) : 31912;
-  console.log(`[Domain] Scanning ±300 from ${lastNum}...`);
-
-  // Build all candidates at once — nearby first for faster resolution
-  const allCandidates = [];
-  // Nearby (±5) first, then expanding
-  for (let d = 0; d <= 300; d++) {
-    for (const sign of [1, -1]) {
-      const n = lastNum + d * sign;
-      if (n < 1) continue;
-      for (const tld of ['best', 'xyz', 'top']) {
-        allCandidates.push(`https://web${n}x.${DOMAIN_BASE}.${tld}`);
-      }
-    }
-  }
-  // Deduplicate (offset 0 appears twice)
-  const seen = new Set();
-  const unique = allCandidates.filter(d => seen.has(d) ? false : (seen.add(d), true));
-
-  // Race: fire all probes, first 200 wins, abort the rest
-  // Limit concurrency to avoid overwhelming the network (50 at a time)
-  const CONCURRENCY = 60;
-  const ac2 = new AbortController();
-  let found = null;
-
-  const raceTimer = setTimeout(() => ac2.abort(), 8000);
-
-  try {
-    found = await new Promise((resolve, reject) => {
-      let idx = 0;
-      let inFlight = 0;
-      let done = false;
-
-      function launch() {
-        while (inFlight < CONCURRENCY && idx < unique.length && !done) {
-          const domain = unique[idx++];
-          inFlight++;
-          probe(domain, ac2).then(result => {
-            inFlight--;
-            if (done) return;
-            if (result) {
-              done = true;
-              ac2.abort();
-              resolve(result);
-            } else {
-              launch(); // fill the slot
-            }
-            if (inFlight === 0 && idx >= unique.length && !done) {
-              done = true;
-              reject(new Error("exhausted"));
-            }
-          });
-        }
-      }
-      launch();
-      // Safety: if nothing launches
-      if (idx === 0) reject(new Error("no candidates"));
-    });
-  } catch {}
-
-  clearTimeout(raceTimer);
-
-  if (found) return applyFound(found);
-
-  // ── Phase 3: Puppeteer fallback (<15s total budget) ──
+  // ── Phase 2: Puppeteer fallback — solves CF challenge on fasel-hd.cam ──
   const remaining = 15000 - (Date.now() - t0);
   if (remaining > 3000) {
-    console.log(`[Domain] Scan exhausted, Puppeteer fallback (${remaining}ms budget)...`);
+    console.log(`[Domain] Quick check failed, Puppeteer fallback (${remaining}ms budget)...`);
     try {
       const browser = await getBrowser();
       const page = await browser.newPage();
