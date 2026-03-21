@@ -563,6 +563,11 @@ async function getDomain() {
 }
 
 function markDomainBad() {
+  // Cooldown: don't trigger expensive re-scan if we just discovered a domain (<60s ago)
+  if (domainLastCheck > 0 && Date.now() - domainLastCheck < 60000) {
+    console.log(`[Domain] Scan cooldown active, skipping re-discovery`);
+    return;
+  }
   console.log(`[Domain] Marking ${activeDomain} as bad`);
   domainLastCheck = 0;
   workerDomain = null; // force worker page recreation on new domain
@@ -847,28 +852,9 @@ async function searchWebsite(query, domain) {
     });
     if (!resp.ok) {
       console.log(`[WebSearch] HTTP ${resp.status}`);
-      // On 403, mark domain bad and re-discover immediately
       if (resp.status === 403 && isFaselUrl(domain)) {
-        markDomainBad();
-        const newDomain = await getDomain();
-        if (newDomain !== domain && newDomain !== MAIN_DOMAIN) {
-          console.log(`[WebSearch] Retrying on ${newDomain}`);
-          const retryUrl = `${newDomain}/?s=${encodeURIComponent(query)}`;
-          const retryResp = await fetch(retryUrl, {
-            headers: { ...HEADERS },
-            redirect: "follow",
-            signal: AbortSignal.timeout(10000),
-          });
-          if (retryResp.ok) {
-            learnDomainFromUrl(retryResp.url);
-            const html = await retryResp.text();
-            if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
-              return parseSearchResults(html);
-            }
-          }
-        }
-        // If rediscovered domain also fails, try alternate TLDs of the current domain number
-        const numM = (newDomain || domain).match(/web(\d+)x\.faselhdx\.([a-z]+)/);
+        // Try alternate TLDs FIRST (fast — avoids expensive 15-20s domain scan)
+        const numM = domain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
         if (numM) {
           for (const tld of ['top', 'best', 'xyz']) {
             if (tld === numM[2]) continue;
@@ -885,7 +871,6 @@ async function searchWebsite(query, domain) {
                 const altHtml = await altResp.text();
                 if (!altHtml.includes("Just a moment") && !altHtml.includes("Checking your browser")) {
                   console.log(`[WebSearch] Alt TLD works: ${altDomain}`);
-                  // Update active domain to this working one
                   activeDomain = altDomain;
                   domainLastCheck = Date.now();
                   cache.page.clear(); cache.search.clear();
@@ -893,6 +878,25 @@ async function searchWebsite(query, domain) {
                 }
               }
             } catch {}
+          }
+        }
+        // Alt TLDs all failed — full domain rediscovery (expensive, only if cooldown allows)
+        markDomainBad();
+        const newDomain = await getDomain();
+        if (newDomain !== domain && newDomain !== MAIN_DOMAIN) {
+          console.log(`[WebSearch] Retrying on ${newDomain}`);
+          const retryUrl = `${newDomain}/?s=${encodeURIComponent(query)}`;
+          const retryResp = await fetch(retryUrl, {
+            headers: { ...HEADERS },
+            redirect: "follow",
+            signal: AbortSignal.timeout(10000),
+          });
+          if (retryResp.ok) {
+            learnDomainFromUrl(retryResp.url);
+            const html = await retryResp.text();
+            if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
+              return parseSearchResults(html);
+            }
           }
         }
       }
@@ -1508,6 +1512,9 @@ async function resolve(imdbId, type, season, episode) {
     queries.push(parts[0].trim()); // main title before colon/dash (e.g. "Peaky Blinders")
   }
   queries.push(info.title); // full original title
+  // Strip only trailing punctuation (e.g. "The O.C." → "The O.C" — FaselHD needs internal periods)
+  const noTrailing = info.title.replace(/[.!?]+$/, "").trim();
+  if (noTrailing !== info.title && !queries.includes(noTrailing)) queries.push(noTrailing);
   // Strip special characters (including periods — e.g. "The O.C." → "The OC")
   const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
   if (cleaned !== info.title && !queries.includes(cleaned)) queries.push(cleaned);
