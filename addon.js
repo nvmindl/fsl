@@ -447,10 +447,6 @@ async function discoverDomain() {
       quickCandidates.add(`https://web${numMatch[1]}x.${DOMAIN_BASE}.${t}`);
     }
   }
-  // Also try known-good domain number 3216 across TLDs (fallback for stale env)
-  for (const t of ['best', 'xyz', 'top']) {
-    quickCandidates.add(`https://web3216x.${DOMAIN_BASE}.${t}`);
-  }
 
   if (quickCandidates.size) {
     console.log(`[Domain] Quick probing ${quickCandidates.size} candidates...`);
