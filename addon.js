@@ -433,27 +433,32 @@ async function discoverDomain() {
     return domain;
   }
 
-  // ── Phase 1: Quick check current domain + TLD swap + main domain redirect (parallel, <3s) ──
+  // ── Phase 1: Quick check current domain + TLD swap + main domain redirect (parallel, <5s) ──
   const numMatch = activeDomain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
-  const quickCandidates = [];
+  const quickCandidates = new Set();
   // Always try the main domain — it redirects to the current working subdomain
-  quickCandidates.push(MAIN_DOMAIN);
+  quickCandidates.add(MAIN_DOMAIN);
   if (activeDomain !== MAIN_DOMAIN && activeDomain.includes(DOMAIN_BASE)) {
-    quickCandidates.push(activeDomain);
+    quickCandidates.add(activeDomain);
   }
+  // Try all TLDs of the current domain number
   if (numMatch) {
     for (const t of ['best', 'xyz', 'top']) {
-      const d = `https://web${numMatch[1]}x.${DOMAIN_BASE}.${t}`;
-      if (d !== activeDomain) quickCandidates.push(d);
+      quickCandidates.add(`https://web${numMatch[1]}x.${DOMAIN_BASE}.${t}`);
     }
   }
+  // Also try known-good domain number 3216 across TLDs (fallback for stale env)
+  for (const t of ['best', 'xyz', 'top']) {
+    quickCandidates.add(`https://web3216x.${DOMAIN_BASE}.${t}`);
+  }
 
-  if (quickCandidates.length) {
+  if (quickCandidates.size) {
+    console.log(`[Domain] Quick probing ${quickCandidates.size} candidates...`);
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 5000);
     try {
       const result = await Promise.any(
-        quickCandidates.map(d => probe(d, ac).then(r => r || Promise.reject()))
+        [...quickCandidates].map(d => probe(d, ac).then(r => r || Promise.reject()))
       );
       clearTimeout(timer);
       ac.abort();
