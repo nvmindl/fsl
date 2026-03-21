@@ -832,12 +832,14 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
 // ── Website search (AJAX API — FaselHD's /?s= is dead, uses admin-ajax.php) ──
 async function searchWebsite(query, domain) {
   try {
+    // Strip special chars that break FaselHD AJAX (apostrophes, backticks, etc.)
+    const cleanQuery = query.replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
     const ajaxUrl = `${domain}/wp-admin/admin-ajax.php`;
-    console.log(`[WebSearch] POST ${ajaxUrl} trsearch="${query}"`);
+    console.log(`[WebSearch] POST ${ajaxUrl} trsearch="${cleanQuery}"`);
     const resp = await fetch(ajaxUrl, {
       method: "POST",
       headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
-      body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
+      body: `action=dtc_live&trsearch=${encodeURIComponent(cleanQuery)}`,
       redirect: "follow",
       signal: AbortSignal.timeout(10000),
     });
@@ -976,8 +978,9 @@ async function searchWebsite(query, domain) {
 // ── Browser-based search (fallback when HTTP is CF-blocked) ──
 async function searchViaBrowser(query, domain) {
   try {
-    // Use Puppeteer to navigate to the search page and extract AJAX results
-    const searchUrl = `${domain}/search/${encodeURIComponent(query)}`;
+    // Strip special chars that break FaselHD search 
+    const cleanQuery = query.replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
+    const searchUrl = `${domain}/search/${encodeURIComponent(cleanQuery)}`;
     console.log(`[BrowserSearch] ${searchUrl}`);
     const html = await fetchPage(searchUrl);
     if (!html) return [];
@@ -1561,19 +1564,20 @@ async function resolve(imdbId, type, season, episode) {
   console.log(`[Resolve] "${info.title}" (${info.year})`);
 
   // Build search queries — FaselHD struggles with special chars like apostrophes/colons
-  // Order: main title first (most likely to match), then full, then cleaned, then subtitle
+  // Order: cleaned first (AJAX may only get 1 shot before rate-limiting), then full, then variants
   const queries = [];
   const parts = info.title.split(/[:\-–—]\s*/);
+  // Strip special characters first (most reliable for AJAX — e.g. "JoJo's" → "JoJos")
+  const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
   if (parts.length > 1) {
-    queries.push(parts[0].trim()); // main title before colon/dash (e.g. "Peaky Blinders")
+    const cleanedMain = parts[0].trim().replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
+    queries.push(cleanedMain); // cleaned main title before colon/dash
   }
-  queries.push(info.title); // full original title
+  if (!queries.includes(cleaned)) queries.push(cleaned); // cleaned full title
+  if (info.title !== cleaned && !queries.includes(info.title)) queries.push(info.title); // original (fallback)
   // Strip only trailing punctuation (e.g. "The O.C." → "The O.C" — FaselHD needs internal periods)
   const noTrailing = info.title.replace(/[.!?]+$/, "").trim();
   if (noTrailing !== info.title && !queries.includes(noTrailing)) queries.push(noTrailing);
-  // Strip special characters (including periods — e.g. "The O.C." → "The OC")
-  const cleaned = info.title.replace(/[''`:;,!?.]/g, "").replace(/\s+/g, " ").trim();
-  if (cleaned !== info.title && !queries.includes(cleaned)) queries.push(cleaned);
   // Try periods → spaces (e.g. "The O.C." → "The O C" → search matches "o-c" slug)
   const spaceDots = info.title.replace(/\./g, " ").replace(/\s+/g, " ").trim();
   if (spaceDots !== info.title && !queries.includes(spaceDots)) queries.push(spaceDots);
@@ -2275,7 +2279,7 @@ const server = http.createServer(async (req, res) => {
     const chromiumExists = fs.existsSync(CHROME_PATH);
     const info = {
       status: "ok",
-      version: "2026-03-21c",
+      version: "2026-03-21d",
       domain: activeDomain,
       domainAge: Date.now() - domainLastCheck,
       browserConnected: browserInstance ? browserInstance.isConnected() : false,
