@@ -343,12 +343,15 @@ let domainDiscoveryPromise = null;
 async function discoverDomain() {
   const t0 = Date.now();
 
-  // Helper: probe a single domain, returns working domain or null
+  // Helper: probe a single domain — tests AJAX search endpoint (not just homepage)
+  // Homepage can return 200 while AJAX is blocked, so this catches broken domains
   async function probe(domain, ac) {
     try {
-      const resp = await fetch(`${domain}/`, {
+      const resp = await fetch(`${domain}/wp-admin/admin-ajax.php`, {
+        method: "POST",
+        headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+        body: "action=dtc_live&trsearch=test",
         redirect: "manual",
-        headers: { "User-Agent": UA },
         signal: ac ? ac.signal : AbortSignal.timeout(3000),
       });
       if (resp.status === 200) return domain;
@@ -357,13 +360,35 @@ async function discoverDomain() {
         const m = loc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
         if (m) {
           const target = m[0].replace(/^http:/, "https:");
-          // Verify the redirect target is actually alive
-          const resp2 = await fetch(`${target}/`, {
+          const resp2 = await fetch(`${target}/wp-admin/admin-ajax.php`, {
+            method: "POST",
+            headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+            body: "action=dtc_live&trsearch=test",
+            redirect: "manual",
+            signal: ac ? ac.signal : AbortSignal.timeout(3000),
+          });
+          if (resp2.status === 200) return target;
+        }
+        // Redirect to fasel-hd.cam? Follow the chain: fasel-hd.cam → working subdomain
+        if (loc.includes("fasel-hd.cam")) {
+          const mainResp = await fetch(loc.split('?')[0], {
             redirect: "manual",
             headers: { "User-Agent": UA },
             signal: ac ? ac.signal : AbortSignal.timeout(3000),
           });
-          if (resp2.status === 200) return target;
+          const mainLoc = mainResp.headers?.get("location") || "";
+          const mainM = mainLoc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+          if (mainM) {
+            const mainTarget = mainM[0].replace(/^http:/, "https:");
+            const resp3 = await fetch(`${mainTarget}/wp-admin/admin-ajax.php`, {
+              method: "POST",
+              headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+              body: "action=dtc_live&trsearch=test",
+              redirect: "manual",
+              signal: ac ? ac.signal : AbortSignal.timeout(3000),
+            });
+            if (resp3.status === 200) return mainTarget;
+          }
         }
       }
     } catch {}
@@ -502,11 +527,6 @@ async function getDomain() {
 }
 
 function markDomainBad() {
-  // Cooldown: don't trigger expensive re-scan if we just discovered a domain (<60s ago)
-  if (domainLastCheck > 0 && Date.now() - domainLastCheck < 60000) {
-    console.log(`[Domain] Scan cooldown active, skipping re-discovery`);
-    return;
-  }
   console.log(`[Domain] Marking ${activeDomain} as bad`);
   domainLastCheck = 0;
   workerDomain = null; // force worker page recreation on new domain
@@ -794,10 +814,45 @@ async function searchWebsite(query, domain) {
     if (!resp.ok) {
       console.log(`[WebSearch] HTTP ${resp.status}`);
       if (resp.status === 403 && isFaselUrl(domain)) {
-        // Try alternate TLDs FIRST (fast)
+        // Try main domain redirect FIRST — fastest way to find current working domain
+        try {
+          console.log(`[WebSearch] Checking main domain redirect...`);
+          const mainResp = await fetch(`${MAIN_DOMAIN}/`, {
+            redirect: "manual",
+            headers: { "User-Agent": UA },
+            signal: AbortSignal.timeout(5000),
+          });
+          const mainLoc = mainResp.headers?.get("location") || "";
+          const mainM = mainLoc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+          if (mainM) {
+            const mainDomain = mainM[0].replace(/^http:/, "https:");
+            if (mainDomain !== domain) {
+              console.log(`[WebSearch] Main domain redirects to ${mainDomain}, trying AJAX...`);
+              const mainAjax = await fetch(`${mainDomain}/wp-admin/admin-ajax.php`, {
+                method: "POST",
+                headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+                body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
+                redirect: "follow",
+                signal: AbortSignal.timeout(8000),
+              });
+              if (mainAjax.ok) {
+                const mainHtml = await mainAjax.text();
+                if (mainHtml.length > 50 && !mainHtml.includes("Just a moment")) {
+                  console.log(`[WebSearch] Main redirect domain works: ${mainDomain}`);
+                  activeDomain = mainDomain;
+                  domainLastCheck = Date.now();
+                  cache.page.clear(); cache.search.clear();
+                  return parseSearchResults(mainHtml);
+                }
+              }
+            }
+          }
+        } catch (e) { console.log(`[WebSearch] Main domain check failed: ${e.message}`); }
+
+        // Try alternate TLDs of current domain number
         const numM = domain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
         if (numM) {
-          for (const tld of ['top', 'best', 'xyz']) {
+          for (const tld of ['best', 'top', 'xyz']) {
             if (tld === numM[2]) continue;
             const altDomain = `https://web${numM[1]}x.${DOMAIN_BASE}.${tld}`;
             try {
@@ -818,8 +873,11 @@ async function searchWebsite(query, domain) {
                   cache.page.clear(); cache.search.clear();
                   return parseSearchResults(altHtml);
                 }
+                console.log(`[WebSearch] Alt TLD ${tld}: response too short or CF blocked (${altHtml.length} chars)`);
+              } else {
+                console.log(`[WebSearch] Alt TLD ${tld}: HTTP ${altResp.status}`);
               }
-            } catch {}
+            } catch (e) { console.log(`[WebSearch] Alt TLD ${tld}: ${e.message}`); }
           }
         }
         // Alt TLDs all failed — full domain rediscovery
@@ -1501,14 +1559,17 @@ async function resolve(imdbId, type, season, episode) {
     const bestQuery = parts.length > 1 ? parts[0].trim() : info.title;
     console.log(`[Resolve] All HTTP searches failed, browser fallback: "${bestQuery}"`);
     results = await searchViaBrowser(bestQuery, domain);
-    // Filter by type
+    // Filter by type AND relevance
     if (results.length > 0) {
-      if (type === "movie") {
-        const f = results.filter(r => r.url.includes("/movies/") || r.url.includes("/hindi/") || r.url.includes("/asian-movies/") || r.url.includes("/anime-movies/"));
-        if (f.length) results = f;
-      } else if (type === "series") {
-        const f = results.filter(r => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/") || r.url.includes("/asian-series/") || r.url.includes("/episodes/"));
-        if (f.length) results = f;
+      results = filterResultsByRelevance(results, info.title, info.year);
+      if (results.length > 0) {
+        if (type === "movie") {
+          const f = results.filter(r => r.url.includes("/movies/") || r.url.includes("/hindi/") || r.url.includes("/asian-movies/") || r.url.includes("/anime-movies/"));
+          if (f.length) results = f;
+        } else if (type === "series") {
+          const f = results.filter(r => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/") || r.url.includes("/asian-series/") || r.url.includes("/episodes/"));
+          if (f.length) results = f;
+        }
       }
     }
   }
