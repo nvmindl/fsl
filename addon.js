@@ -438,28 +438,32 @@ async function discoverDomain() {
         }
 
         if (foundDomain) {
-          // Puppeteer found a domain — verify search works, try alternate TLDs if not
+          // Puppeteer found a domain — verify AJAX search works
           const numM = foundDomain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
           if (numM) {
             const domNum = numM[1];
             const foundTld = numM[2];
-            // Quick search test on the found domain
+            // Quick AJAX test on the found domain
             try {
-              const testResp = await fetch(`${foundDomain}/?s=test`, {
-                headers: { "User-Agent": UA },
+              const testResp = await fetch(`${foundDomain}/wp-admin/admin-ajax.php`, {
+                method: "POST",
+                headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+                body: "action=dtc_live&trsearch=test",
                 redirect: "follow",
                 signal: AbortSignal.timeout(5000),
               });
               if (testResp.ok) return applyFound(foundDomain);
             } catch {}
-            // Search failed — try same number with other TLDs
-            console.log(`[Domain] ${foundDomain} search blocked, trying alternate TLDs...`);
+            // AJAX failed — try same number with other TLDs
+            console.log(`[Domain] ${foundDomain} AJAX blocked, trying alternate TLDs...`);
             for (const tld of ['top', 'best', 'xyz']) {
               if (tld === foundTld) continue;
               const alt = `https://web${domNum}x.${DOMAIN_BASE}.${tld}`;
               try {
-                const altResp = await fetch(`${alt}/?s=test`, {
-                  headers: { "User-Agent": UA },
+                const altResp = await fetch(`${alt}/wp-admin/admin-ajax.php`, {
+                  method: "POST",
+                  headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+                  body: "action=dtc_live&trsearch=test",
                   redirect: "follow",
                   signal: AbortSignal.timeout(3000),
                 });
@@ -469,7 +473,7 @@ async function discoverDomain() {
                 }
               } catch {}
             }
-            // No TLD has working search — use what Puppeteer found anyway
+            // No TLD has working AJAX — use what Puppeteer found anyway
             return applyFound(foundDomain);
           }
           return applyFound(foundDomain);
@@ -775,36 +779,39 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   }));
 }
 
-// ── Website search (fast HTTP, follows redirects, finds everything) ──
+// ── Website search (AJAX API — FaselHD's /?s= is dead, uses admin-ajax.php) ──
 async function searchWebsite(query, domain) {
   try {
-    const searchUrl = `${domain}/?s=${encodeURIComponent(query)}`;
-    console.log(`[WebSearch] ${searchUrl}`);
-    const resp = await fetch(searchUrl, {
-      headers: { ...HEADERS },
+    const ajaxUrl = `${domain}/wp-admin/admin-ajax.php`;
+    console.log(`[WebSearch] POST ${ajaxUrl} trsearch="${query}"`);
+    const resp = await fetch(ajaxUrl, {
+      method: "POST",
+      headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+      body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
       redirect: "follow",
       signal: AbortSignal.timeout(10000),
     });
     if (!resp.ok) {
       console.log(`[WebSearch] HTTP ${resp.status}`);
       if (resp.status === 403 && isFaselUrl(domain)) {
-        // Try alternate TLDs FIRST (fast — avoids expensive 15-20s domain scan)
+        // Try alternate TLDs FIRST (fast)
         const numM = domain.match(/web(\d+)x\.faselhdx\.([a-z]+)/);
         if (numM) {
           for (const tld of ['top', 'best', 'xyz']) {
             if (tld === numM[2]) continue;
             const altDomain = `https://web${numM[1]}x.${DOMAIN_BASE}.${tld}`;
             try {
-              const altUrl = `${altDomain}/?s=${encodeURIComponent(query)}`;
-              console.log(`[WebSearch] Trying alt TLD: ${altUrl}`);
-              const altResp = await fetch(altUrl, {
-                headers: { ...HEADERS },
+              console.log(`[WebSearch] Trying alt TLD: ${altDomain}`);
+              const altResp = await fetch(`${altDomain}/wp-admin/admin-ajax.php`, {
+                method: "POST",
+                headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+                body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
                 redirect: "follow",
                 signal: AbortSignal.timeout(8000),
               });
               if (altResp.ok) {
                 const altHtml = await altResp.text();
-                if (!altHtml.includes("Just a moment") && !altHtml.includes("Checking your browser")) {
+                if (altHtml.length > 50 && !altHtml.includes("Just a moment")) {
                   console.log(`[WebSearch] Alt TLD works: ${altDomain}`);
                   activeDomain = altDomain;
                   domainLastCheck = Date.now();
@@ -815,21 +822,22 @@ async function searchWebsite(query, domain) {
             } catch {}
           }
         }
-        // Alt TLDs all failed — full domain rediscovery (expensive, only if cooldown allows)
+        // Alt TLDs all failed — full domain rediscovery
         markDomainBad();
         const newDomain = await getDomain();
         if (newDomain !== domain && newDomain !== MAIN_DOMAIN) {
           console.log(`[WebSearch] Retrying on ${newDomain}`);
-          const retryUrl = `${newDomain}/?s=${encodeURIComponent(query)}`;
-          const retryResp = await fetch(retryUrl, {
-            headers: { ...HEADERS },
+          const retryResp = await fetch(`${newDomain}/wp-admin/admin-ajax.php`, {
+            method: "POST",
+            headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+            body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
             redirect: "follow",
             signal: AbortSignal.timeout(10000),
           });
           if (retryResp.ok) {
             learnDomainFromUrl(retryResp.url);
             const html = await retryResp.text();
-            if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
+            if (html.length > 50 && !html.includes("Just a moment")) {
               return parseSearchResults(html);
             }
           }
@@ -844,30 +852,32 @@ async function searchWebsite(query, domain) {
       markDomainBad();
       const newDomain = await getDomain();
       if (newDomain !== MAIN_DOMAIN) {
-        const retryUrl = `${newDomain}/?s=${encodeURIComponent(query)}`;
-        console.log(`[WebSearch] Retrying: ${retryUrl}`);
-        const retryResp = await fetch(retryUrl, {
-          headers: { ...HEADERS },
+        console.log(`[WebSearch] Retrying on ${newDomain}`);
+        const retryResp = await fetch(`${newDomain}/wp-admin/admin-ajax.php`, {
+          method: "POST",
+          headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+          body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
           redirect: "follow",
           signal: AbortSignal.timeout(15000),
         });
         if (retryResp.ok) {
           learnDomainFromUrl(retryResp.url);
           const html = await retryResp.text();
-          if (!html.includes("Just a moment") && !html.includes("Checking your browser")) {
+          if (html.length > 50 && !html.includes("Just a moment")) {
             return parseSearchResults(html);
           }
         }
       }
       return [];
     }
-    // Learn working domain from redirect target
     learnDomainFromUrl(resp.url);
     const html = await resp.text();
     if (html.includes("Just a moment") || html.includes("Checking your browser")) {
       console.log("[WebSearch] CF blocked, will try browser fallback");
       return [];
     }
+    // "لا يوجد نتائج" = "No results" — don't try to parse
+    if (html.length < 50) return [];
     return parseSearchResults(html);
   } catch (err) {
     console.error(`[WebSearch] ${err.message}`);
@@ -878,7 +888,8 @@ async function searchWebsite(query, domain) {
 // ── Browser-based search (fallback when HTTP is CF-blocked) ──
 async function searchViaBrowser(query, domain) {
   try {
-    const searchUrl = `${domain}/?s=${encodeURIComponent(query)}`;
+    // Use Puppeteer to navigate to the search page and extract AJAX results
+    const searchUrl = `${domain}/search/${encodeURIComponent(query)}`;
     console.log(`[BrowserSearch] ${searchUrl}`);
     const html = await fetchPage(searchUrl);
     if (!html) return [];
@@ -893,11 +904,12 @@ function parseSearchResults(html) {
   const $ = cheerio.load(html);
   const results = [];
   const seen = new Set();
+  // FaselHD content URL patterns
+  const contentPat = /\/(movies|seasons|series|anime|hindi|asian-series|asian-movies|anime-movies|anime-episodes|asian-episodes|episodes)\//;
   // Find all links pointing to content pages
   $("a[href]").each((_, el) => {
     const href = $(el).attr("href") || "";
-    if (href && (href.includes("/movies/") || href.includes("/seasons/") || href.includes("/series/") || href.includes("/anime/"))) {
-      // Normalize: strip query/hash, deduplicate
+    if (href && contentPat.test(href)) {
       const clean = href.split("?")[0].split("#")[0];
       if (seen.has(clean)) return;
       seen.add(clean);
@@ -972,10 +984,10 @@ async function searchFasel(query, year, type) {
   // Filter by type
   if (results.length > 0) {
     if (type === "movie") {
-      const f = results.filter((r) => r.url.includes("/movies/"));
+      const f = results.filter((r) => r.url.includes("/movies/") || r.url.includes("/hindi/") || r.url.includes("/asian-movies/") || r.url.includes("/anime-movies/"));
       if (f.length) results = f;
     } else if (type === "series") {
-      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/"));
+      const f = results.filter((r) => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/") || r.url.includes("/asian-series/") || r.url.includes("/episodes/") || r.url.includes("/anime-episodes/") || r.url.includes("/asian-episodes/"));
       if (f.length) results = f;
     }
   }
@@ -1492,10 +1504,10 @@ async function resolve(imdbId, type, season, episode) {
     // Filter by type
     if (results.length > 0) {
       if (type === "movie") {
-        const f = results.filter(r => r.url.includes("/movies/"));
+        const f = results.filter(r => r.url.includes("/movies/") || r.url.includes("/hindi/") || r.url.includes("/asian-movies/") || r.url.includes("/anime-movies/"));
         if (f.length) results = f;
       } else if (type === "series") {
-        const f = results.filter(r => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/"));
+        const f = results.filter(r => r.url.includes("/seasons/") || r.url.includes("/series/") || r.url.includes("/anime/") || r.url.includes("/asian-series/") || r.url.includes("/episodes/"));
         if (f.length) results = f;
       }
     }
