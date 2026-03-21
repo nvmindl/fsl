@@ -1487,6 +1487,11 @@ function filterResultsByRelevance(results, title, year) {
   const noTheSlug = slugify(title.replace(/^the\s+/i, "").replace(/[.]/g, "")); // e.g. "oc"
   const words = titleSlug.split("-").filter(w => w.length > 1); // significant words
 
+  // Detect if results span both anime and non-anime categories
+  const hasAnime = results.some(r => /\/anime\/|\/anime-episodes\//.test(r.url));
+  const hasNonAnime = results.some(r => /\/seasons\/|\/series\/|\/asian-series\/|\/episodes\//.test(r.url));
+  const needDisambig = hasAnime && hasNonAnime;
+
   const scored = results.map(r => {
     const decoded = decodeURIComponent(r.url).toLowerCase();
     let score = 0;
@@ -1503,6 +1508,22 @@ function filterResultsByRelevance(results, title, year) {
     for (const w of words) {
       if (decoded.includes(w)) score += 5;
     }
+
+    // Anime vs live-action disambiguation: when both categories exist,
+    // use IMDB year to prefer the right one. Live-action adaptations of
+    // anime are typically newer; the original anime is older.
+    if (needDisambig && year) {
+      const isAnimeUrl = /\/anime\/|\/anime-episodes\//.test(r.url);
+      if (year >= 2010 && !isAnimeUrl) score += 15;
+      else if (year < 2010 && isAnimeUrl) score += 15;
+    }
+
+    // Slug exactness: penalize extra words in URL that aren't in the title
+    // e.g. "/anime/one-piece-egghead-arc" has "egghead","arc" extra vs title "one-piece"
+    const lastSeg = decoded.split("/").pop() || "";
+    const segWords = lastSeg.replace(/[^a-z0-9-]/g, "").split("-").filter(w => w.length > 1);
+    const extraWords = segWords.filter(w => !words.includes(w));
+    score -= extraWords.length * 2;
 
     return { ...r, score };
   });
@@ -2254,7 +2275,7 @@ const server = http.createServer(async (req, res) => {
     const chromiumExists = fs.existsSync(CHROME_PATH);
     const info = {
       status: "ok",
-      version: "2026-03-21b",
+      version: "2026-03-21c",
       domain: activeDomain,
       domainAge: Date.now() - domainLastCheck,
       browserConnected: browserInstance ? browserInstance.isConnected() : false,
