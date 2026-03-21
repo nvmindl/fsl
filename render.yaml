@@ -9,4 +9,4 @@ services:
       - key: PUBLIC_URL
         value: "https://faselhdx.onrender.com"
       - key: FASELHDX_DOMAIN
-        value: "web31912x.faselhdx.best"
+        value: "web3216x.faselhdx.best"

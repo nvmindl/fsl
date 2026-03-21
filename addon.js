@@ -336,7 +336,7 @@ const DOMAIN_BASE = "faselhdx";
 const MAIN_DOMAIN = "https://www.fasel-hd.cam";
 function isFaselUrl(url) { return url.includes(DOMAIN_BASE) || url.includes("fasel-hd.cam") || url.includes("faselhd."); }
 let activeDomain = process.env.FASELHDX_DOMAIN ? `https://${process.env.FASELHDX_DOMAIN.replace(/^https?:\/\//, "")}` : MAIN_DOMAIN;
-let domainLastCheck = process.env.FASELHDX_DOMAIN ? Date.now() : 0; // Skip discovery if domain provided
+let domainLastCheck = 0; // Always verify domain on first request — env var may be stale
 const DOMAIN_TTL = 5 * 60 * 1000; // 5 min — check more often since domains rotate fast
 let domainDiscoveryPromise = null;
 
@@ -346,13 +346,41 @@ async function discoverDomain() {
   // Helper: probe a single domain — tests AJAX search endpoint (not just homepage)
   // Homepage can return 200 while AJAX is blocked, so this catches broken domains
   async function probe(domain, ac) {
+    const sig = ac ? ac.signal : AbortSignal.timeout(3000);
     try {
+      // For the main domain (fasel-hd.cam), GET the root to find the redirect target
+      // then AJAX-test that target. CF blocks direct AJAX POSTs to fasel-hd.cam.
+      if (domain.includes("fasel-hd.cam")) {
+        const mainResp = await fetch(`${domain}/`, {
+          redirect: "manual",
+          headers: { "User-Agent": UA },
+          signal: sig,
+        });
+        if (mainResp.status === 301 || mainResp.status === 302) {
+          const mainLoc = mainResp.headers.get("location") || "";
+          const mainM = mainLoc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
+          if (mainM) {
+            const target = mainM[0].replace(/^http:/, "https:");
+            const resp2 = await fetch(`${target}/wp-admin/admin-ajax.php`, {
+              method: "POST",
+              headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
+              body: "action=dtc_live&trsearch=test",
+              redirect: "manual",
+              signal: sig,
+            });
+            if (resp2.status === 200) return target;
+          }
+        }
+        return null;
+      }
+
+      // For regular subdomains, test AJAX directly
       const resp = await fetch(`${domain}/wp-admin/admin-ajax.php`, {
         method: "POST",
         headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
         body: "action=dtc_live&trsearch=test",
         redirect: "manual",
-        signal: ac ? ac.signal : AbortSignal.timeout(3000),
+        signal: sig,
       });
       if (resp.status === 200) return domain;
       if (resp.status === 301 || resp.status === 302) {
@@ -365,16 +393,17 @@ async function discoverDomain() {
             headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
             body: "action=dtc_live&trsearch=test",
             redirect: "manual",
-            signal: ac ? ac.signal : AbortSignal.timeout(3000),
+            signal: sig,
           });
           if (resp2.status === 200) return target;
         }
         // Redirect to fasel-hd.cam? Follow the chain: fasel-hd.cam → working subdomain
         if (loc.includes("fasel-hd.cam")) {
-          const mainResp = await fetch(loc.split('?')[0], {
+          const mainOrigin = new URL(loc).origin;
+          const mainResp = await fetch(`${mainOrigin}/`, {
             redirect: "manual",
             headers: { "User-Agent": UA },
-            signal: ac ? ac.signal : AbortSignal.timeout(3000),
+            signal: sig,
           });
           const mainLoc = mainResp.headers?.get("location") || "";
           const mainM = mainLoc.match(/https?:\/\/web\d+x\.faselhdx\.[a-z]+/);
@@ -385,7 +414,7 @@ async function discoverDomain() {
               headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
               body: "action=dtc_live&trsearch=test",
               redirect: "manual",
-              signal: ac ? ac.signal : AbortSignal.timeout(3000),
+              signal: sig,
             });
             if (resp3.status === 200) return mainTarget;
           }
@@ -421,7 +450,7 @@ async function discoverDomain() {
 
   if (quickCandidates.length) {
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 3000);
+    const timer = setTimeout(() => ac.abort(), 5000);
     try {
       const result = await Promise.any(
         quickCandidates.map(d => probe(d, ac).then(r => r || Promise.reject()))
