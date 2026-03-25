@@ -1514,8 +1514,10 @@ function filterResultsByRelevance(results, title, year) {
   }
 
   // Exact Latin segment match: "dark" matches only if it's a standalone Latin group
+  // Also strips trailing year from segments: "goat-2026" → "goat" for matching
   function slugMatch(slug, text) {
-    return extractLatinSlugs(text).includes(slug);
+    const segs = extractLatinSlugs(text);
+    return segs.some(s => s === slug || s.replace(/-\d{4}$/, "") === slug);
   }
 
   // Check if slug appears anywhere as substring (weaker match)
@@ -1822,7 +1824,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.3",
+  version: "1.0.4",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
