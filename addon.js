@@ -1719,6 +1719,11 @@ async function probeDirectUrls(slug, year, type) {
   // FaselHD URL patterns: /seasons/مسلسل-{slug}, /movies/فيلم-{slug}-{year}-مترجم, etc.
   const candidates = [];
   if (type === "series") {
+    // Try with year first (more specific → avoid wrong show with same name)
+    if (year) {
+      candidates.push(`${domain}/seasons/%d9%85%d8%b3%d9%84%d8%b3%d9%84-${slug}-${year}`);
+      candidates.push(`${domain}/series/%d9%85%d8%b3%d9%84%d8%b3%d9%84-${slug}-${year}`);
+    }
     candidates.push(`${domain}/seasons/%d9%85%d8%b3%d9%84%d8%b3%d9%84-${slug}`);
     candidates.push(`${domain}/series/%d9%85%d8%b3%d9%84%d8%b3%d9%84-${slug}`);
     candidates.push(`${domain}/anime/%d8%a7%d9%86%d9%85%d9%8a-${slug}`);
@@ -1729,27 +1734,42 @@ async function probeDirectUrls(slug, year, type) {
   }
   if (!candidates.length) return [];
 
-  console.log(`[Probe] Trying ${candidates.length} direct URLs for "${slug}"`);
+  console.log(`[Probe] Trying ${candidates.length} direct URLs for "${slug}" (year=${year})`);
   const results = [];
-  // Probe in parallel with short timeout
-  const probes = candidates.map(url =>
-    fetch(url, {
-      headers: { ...HEADERS, ...(getCfCookies(url) ? { Cookie: getCfCookies(url) } : {}) },
-      redirect: "follow",
-      signal: AbortSignal.timeout(8000),
-    }).then(async resp => {
-      if (!resp.ok) return;
+  // Probe sequentially — stop at first hit (year-inclusive URLs are tried first)
+  for (const url of candidates) {
+    try {
+      const resp = await fetch(url, {
+        headers: { ...HEADERS, ...(getCfCookies(url) ? { Cookie: getCfCookies(url) } : {}) },
+        redirect: "follow",
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) { console.log(`[Probe] ${resp.status}: ${url.substring(url.lastIndexOf("/") + 1, url.lastIndexOf("/") + 40)}`); continue; }
       const html = await resp.text();
-      if (html.length > 2000 && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
-        // Verify it's a content page (has player or episode links)
-        if (html.includes("player_token") || html.includes("seasonDiv") || html.includes("epAll")) {
-          console.log(`[Probe] HIT: ${url} (${html.length} chars)`);
-          results.push({ url: resp.url || url, title: "" });
+      if (html.length < 2000 || html.includes("Just a moment") || html.includes("Checking your browser")) continue;
+      // Verify it's a content page (has player or episode links)
+      if (!html.includes("player_token") && !html.includes("seasonDiv") && !html.includes("epAll")) continue;
+      // Year validation: check page content for the expected year (in URL, title, or page text)
+      const finalUrl = resp.url || url;
+      const finalDecoded = decodeURIComponent(finalUrl).toLowerCase();
+      if (year) {
+        const yearStr = String(year);
+        const hasYear = finalDecoded.includes(yearStr) || html.includes(yearStr);
+        if (!hasYear) {
+          // Check adjacent years (±1) as FaselHD sometimes has slightly different year
+          const hasAdjacent = html.includes(String(year - 1)) || html.includes(String(year + 1));
+          if (!hasAdjacent) {
+            console.log(`[Probe] Year mismatch: expected ${year}, not found on page — skipping ${finalUrl.substring(finalUrl.lastIndexOf("/") + 1, finalUrl.lastIndexOf("/") + 50)}`);
+            continue;
+          }
+          console.log(`[Probe] Adjacent year match (±1) accepted`);
         }
       }
-    }).catch(() => {})
-  );
-  await Promise.all(probes);
+      console.log(`[Probe] HIT: ${finalUrl.substring(finalUrl.lastIndexOf("/") + 1)} (${html.length} chars)`);
+      results.push({ url: finalUrl, title: "" });
+      break; // stop at first valid match
+    } catch {}
+  }
   return results;
 }
 
@@ -1990,7 +2010,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.9",
+  version: "1.0.10",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
