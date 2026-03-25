@@ -842,9 +842,28 @@ async function searchSitemaps(domain, prefix, maxNum, slug, year) {
   }));
 }
 
+// ── AJAX CF-block tracker ──
+// When AJAX consistently returns 403, skip HTTP attempts and go straight to browser
+let ajaxBlockedUntil = 0;
+const AJAX_BLOCK_TTL = 2 * 60 * 1000; // skip AJAX for 2 min after confirmed block
+
+function markAjaxBlocked() {
+  ajaxBlockedUntil = Date.now() + AJAX_BLOCK_TTL;
+  console.log(`[WebSearch] AJAX blocked, skipping HTTP for ${AJAX_BLOCK_TTL / 1000}s`);
+}
+
+function isAjaxBlocked() {
+  return Date.now() < ajaxBlockedUntil;
+}
+
 // ── Website search (AJAX API — FaselHD's /?s= is dead, uses admin-ajax.php) ──
 async function searchWebsite(query, domain) {
   try {
+    // Skip HTTP entirely if AJAX was recently blocked — saves 20-40s of doomed retries
+    if (isAjaxBlocked()) {
+      console.log(`[WebSearch] AJAX known-blocked, skipping HTTP`);
+      return [];
+    }
     // Strip special chars that break FaselHD AJAX (apostrophes, backticks, etc.)
     const cleanQuery = query.replace(/['']s\b/g, "").replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
     const ajaxUrl = `${domain}/wp-admin/admin-ajax.php`;
@@ -925,26 +944,8 @@ async function searchWebsite(query, domain) {
             } catch (e) { console.log(`[WebSearch] Alt TLD ${tld}: ${e.message}`); }
           }
         }
-        // Alt TLDs all failed — full domain rediscovery
-        markDomainBad();
-        const newDomain = await getDomain();
-        if (newDomain !== domain && newDomain !== MAIN_DOMAIN) {
-          console.log(`[WebSearch] Retrying on ${newDomain}`);
-          const retryResp = await fetch(`${newDomain}/wp-admin/admin-ajax.php`, {
-            method: "POST",
-            headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
-            body: `action=dtc_live&trsearch=${encodeURIComponent(query)}`,
-            redirect: "follow",
-            signal: AbortSignal.timeout(10000),
-          });
-          if (retryResp.ok) {
-            learnDomainFromUrl(retryResp.url);
-            const html = await retryResp.text();
-            if (html.length > 50 && !html.includes("Just a moment")) {
-              return parseSearchResults(html);
-            }
-          }
-        }
+        // Alt TLDs all failed — mark AJAX as blocked, skip future HTTP attempts
+        markAjaxBlocked();
       }
       return [];
     }
@@ -981,6 +982,8 @@ async function searchWebsite(query, domain) {
     }
     // "لا يوجد نتائج" = "No results" — don't try to parse
     if (html.length < 50) return [];
+    // AJAX worked — clear any block flag
+    ajaxBlockedUntil = 0;
     return parseSearchResults(html);
   } catch (err) {
     console.error(`[WebSearch] ${err.message}`);
@@ -1059,7 +1062,7 @@ async function searchFasel(query, year, type) {
   results = await searchWebsite(query, domain);
 
   // If website search failed, refresh domain — it may have been re-discovered
-  if (!results.length) {
+  if (!results.length && !isAjaxBlocked()) {
     const freshDomain = await getDomain();
     if (freshDomain !== domain) {
       console.log(`[Search] Domain changed to ${freshDomain}, retrying website search`);
@@ -1068,8 +1071,8 @@ async function searchFasel(query, year, type) {
     }
   }
 
-  // Strategy 2: Sitemap search (fallback if website search fails)
-  if (!results.length) {
+  // Strategy 2: Sitemap search (fallback — but skip if AJAX is CF-blocked since sitemaps use HTTP too)
+  if (!results.length && !isAjaxBlocked()) {
     if (type === "movie") {
       results = await searchSitemaps(domain, "movies", 14, slug, year);
     } else if (type === "series") {
@@ -1655,6 +1658,8 @@ async function resolve(imdbId, type, season, episode) {
       results = filterResultsByRelevance(results, info.title, info.year);
       if (results.length > 0) break;
     }
+    // If AJAX is blocked, don't loop through more queries — go straight to browser
+    if (isAjaxBlocked()) break;
     if (info.year) {
       results = await searchFasel(`${q} ${info.year}`, info.year, type);
       if (results.length > 0) {
@@ -1817,7 +1822,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.2",
+  version: "1.0.3",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
