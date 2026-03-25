@@ -659,6 +659,11 @@ async function fetchPage(url, retries = 3) {
   // Browser fallback wastes 30-45s on CF timeouts, but HTTP retry 2 often succeeds.
   if (isFaselUrl(url)) {
     for (let i = 0; i < retries; i++) {
+      // Re-check cache (concurrent probe may have cached this URL)
+      if (i > 0) {
+        const mid = cacheGet(cache.page, url, 120000);
+        if (mid) { console.log(`[Fetch] Page cache hit (${mid.length} chars)`); return mid; }
+      }
       console.log(`[Fetch] HTTP (${i + 1}/${retries}) ${url.substring(0, 80)}`);
 
       // Try fast HTTP fetch with cached CF cookies first
@@ -762,6 +767,12 @@ async function fetchPage(url, retries = 3) {
       if (i < retries - 1) await new Promise(r => setTimeout(r, 1000));
     }
 
+    // Check cache before expensive browser fallback (concurrent probe may have cached it)
+    const preBrowser = cacheGet(cache.page, url, 120000);
+    if (preBrowser) {
+      console.log(`[Fetch] Page cache hit (${preBrowser.length} chars)`);
+      return preBrowser;
+    }
     // ALL HTTP retries exhausted — last resort: browser
     console.log(`[Fetch] All HTTP failed, browser fallback: ${url.substring(0, 80)}`);
     const html = await browserFetch(url);
@@ -1881,11 +1892,20 @@ async function resolve(imdbId, type, season, episode) {
     }
   }
 
-  // Final fallback: browser search with the main title (only if everything else failed)
+  // Check probe result BEFORE expensive browser search
+  if (results.length === 0) {
+    const probed = await probePromise;
+    if (probed.length > 0) {
+      results = probed;
+      console.log(`[Resolve] Direct URL probe found ${probed.length} result(s)`);
+    }
+  }
+
+  // Final fallback: browser search with the main title (only if search AND probe failed)
   if (results.length === 0) {
     const domain = await getDomain();
     const bestQuery = parts.length > 1 ? parts[0].trim() : info.title;
-    console.log(`[Resolve] All HTTP searches failed, browser fallback: "${bestQuery}"`);
+    console.log(`[Resolve] All searches + probe failed, browser fallback: "${bestQuery}"`);
     results = await searchViaBrowser(bestQuery, domain);
     // Filter by type AND relevance
     if (results.length > 0) {
@@ -1899,15 +1919,6 @@ async function resolve(imdbId, type, season, episode) {
           if (f.length) results = f;
         }
       }
-    }
-  }
-
-  if (results.length === 0) {
-    // Probe was started concurrently — await its result
-    const probed = await probePromise;
-    if (probed.length > 0) {
-      results = probed;
-      console.log(`[Resolve] Direct URL probe found ${probed.length} result(s)`);
     }
   }
 
@@ -2053,7 +2064,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.13",
+  version: "1.0.14",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
