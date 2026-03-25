@@ -1060,8 +1060,13 @@ async function searchViaBrowser(query, domain) {
       return parseSearchResults(html);
     }
     console.log(`[BrowserSearch] In-page AJAX returned ${html ? html.length : 0} chars`);
-    // /search/ URL returns homepage garbage — don't fall back to it
-    return [];
+
+    // Fallback to /search/ page navigation if in-page AJAX failed
+    console.log(`[BrowserSearch] In-page AJAX failed, trying /search/ URL`);
+    const searchUrl = `${domain}/search/${encodeURIComponent(cleanQuery)}`;
+    const pageHtml = await fetchPage(searchUrl);
+    if (!pageHtml) return [];
+    return parseSearchResults(pageHtml);
   } catch (err) {
     console.error(`[BrowserSearch] ${err.message}`);
     return [];
@@ -1270,15 +1275,24 @@ function pickSeasonResult(results, seasonNum) {
   return null;
 }
 
-// Check if displayed episodes match the requested season number
-function episodesMatchSeason(episodes, sn) {
-  if (episodes.length === 0) return false;
-  const ep1 = decodeURIComponent(episodes[0].url || "");
-  const detected = extractSeasonNum(ep1);
-  return detected > 0 && detected === sn;
+// Parse a series page: extract season URLs and episode URLs
+// Arabic ordinal names for constructing direct season URLs
+const ARABIC_SEASON_NAMES = [
+  "", "الأول", "الثاني", "الثالث", "الرابع", "الخامس",
+  "السادس", "السابع", "الثامن", "التاسع", "العاشر",
+];
+
+// Construct direct season page URL from show page URL + season number
+// e.g. /seasons/مسلسل-dark + season 1 → /seasons/مسلسل-dark-الموسم-الأول
+function buildSeasonUrl(showUrl, seasonNum) {
+  if (seasonNum < 1 || seasonNum > 10) return null;
+  const arabicName = ARABIC_SEASON_NAMES[seasonNum];
+  if (!arabicName) return null;
+  // Strip trailing slash
+  const base = showUrl.replace(/\/$/, "");
+  return `${base}-الموسم-${arabicName}`;
 }
 
-// Parse a series page: extract season URLs and episode URLs
 async function parseSeriesPage(url) {
   const html = await fetchPage(url);
   if (!html) return { seasons: [], episodes: [] };
@@ -1936,31 +1950,55 @@ async function resolve(imdbId, type, season, episode) {
     // Parse the first result's page for season/episode info
     let { seasons, episodes } = await parseSeriesPage(targetUrl);
 
-    // Navigate to the correct season's page
+    // Only navigate to season page if we need a DIFFERENT season (season 1 is usually default)
     if (seasons.length > 0 && episodes.length === 0) {
       // No episodes on current page — need to navigate to season
       const match = seasons.find((s) => s.num === sn);
       if (match) {
-        console.log(`[Resolve] Season ${sn}: ${match.url}`);
-        const seasonPage = await parseSeriesPage(match.url);
-        episodes = seasonPage.episodes;
+        // Try direct season URL first (works with fastFetch, no browser needed)
+        const directUrl = buildSeasonUrl(targetUrl, sn);
+        if (directUrl) {
+          console.log(`[Resolve] Season ${sn} direct: ${directUrl.substring(0, 80)}`);
+          const directPage = await parseSeriesPage(directUrl);
+          if (directPage.episodes.length > 0) {
+            episodes = directPage.episodes;
+          }
+        }
+        // Fall back to shortlink if direct URL didn't work
+        if (episodes.length === 0) {
+          console.log(`[Resolve] Season ${sn} shortlink: ${match.url}`);
+          const seasonPage = await parseSeriesPage(match.url);
+          episodes = seasonPage.episodes;
+        }
       } else {
         console.log(`[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`);
       }
     } else if (seasons.length > 1 && !pickedFromSearch) {
-      // Episodes shown — check if they match the requested season
-      if (episodesMatchSeason(episodes, sn)) {
-        console.log(`[Resolve] Episodes match season ${sn}, using ${episodes.length} episodes`);
-      } else {
-        const match = seasons.find((s) => s.num === sn);
-        if (match) {
-          console.log(`[Resolve] Season ${sn}: ${match.url}`);
-          const seasonPage = await parseSeriesPage(match.url);
-          if (seasonPage.episodes.length > 0) {
-            episodes = seasonPage.episodes;
-          } else {
-            console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
-            episodes = [];
+      // Episodes shown but check if we're on the right season
+      const match = seasons.find((s) => s.num === sn);
+      if (match) {
+        const activeMatch = seasons.find((s) => s.num === sn);
+        if (activeMatch && activeMatch.url !== targetUrl) {
+          // Try direct season URL first
+          const directUrl = buildSeasonUrl(targetUrl, sn);
+          let resolved = false;
+          if (directUrl) {
+            console.log(`[Resolve] Season ${sn} direct: ${directUrl.substring(0, 80)}`);
+            const directPage = await parseSeriesPage(directUrl);
+            if (directPage.episodes.length > 0) {
+              episodes = directPage.episodes;
+              resolved = true;
+            }
+          }
+          if (!resolved) {
+            console.log(`[Resolve] Season ${sn} shortlink: ${activeMatch.url}`);
+            const seasonPage = await parseSeriesPage(activeMatch.url);
+            if (seasonPage.episodes.length > 0) {
+              episodes = seasonPage.episodes;
+            } else {
+              console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
+              episodes = [];
+            }
           }
         }
       }
@@ -2007,7 +2045,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.17",
+  version: "1.0.16",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
