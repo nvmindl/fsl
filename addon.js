@@ -1766,6 +1766,9 @@ async function probeDirectUrls(slug, year, type) {
         }
       }
       console.log(`[Probe] HIT: ${finalUrl.substring(finalUrl.lastIndexOf("/") + 1)} (${html.length} chars)`);
+      // Cache the fetched HTML so parseSeriesPage/getPlayerTokens don't re-fetch
+      cacheSet(cache.page, url, html);
+      cacheSet(cache.page, finalUrl, html);
       results.push({ url: finalUrl, title: "" });
       break; // stop at first valid match
     } catch {}
@@ -2010,7 +2013,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.10",
+  version: "1.0.11",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
