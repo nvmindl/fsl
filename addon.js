@@ -994,13 +994,38 @@ async function searchWebsite(query, domain) {
 // ── Browser-based search (fallback when HTTP is CF-blocked) ──
 async function searchViaBrowser(query, domain) {
   try {
-    // Strip special chars that break FaselHD search 
     const cleanQuery = query.replace(/['']s\b/g, "").replace(/[''`]/g, "").replace(/\s+/g, " ").trim();
+    console.log(`[BrowserSearch] AJAX via Puppeteer: "${cleanQuery}"`);
+
+    // Use the worker page (has CF cookies) to execute AJAX POST from page context
+    const page = await ensureWorkerPage();
+    const ajaxUrl = `${domain}/wp-admin/admin-ajax.php`;
+
+    const html = await page.evaluate(async (url, q) => {
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "action=dtc_live&trsearch=" + encodeURIComponent(q),
+        });
+        if (!resp.ok) return null;
+        return await resp.text();
+      } catch { return null; }
+    }, ajaxUrl, cleanQuery);
+
+    if (html && html.length > 50) {
+      console.log(`[BrowserSearch] AJAX OK (${html.length} chars)`);
+      // AJAX worked via browser — clear the block flag
+      ajaxBlockedUntil = 0;
+      return parseSearchResults(html);
+    }
+
+    // Fallback to /search/ page navigation if in-page AJAX failed
+    console.log(`[BrowserSearch] In-page AJAX failed, trying /search/ URL`);
     const searchUrl = `${domain}/search/${encodeURIComponent(cleanQuery)}`;
-    console.log(`[BrowserSearch] ${searchUrl}`);
-    const html = await fetchPage(searchUrl);
-    if (!html) return [];
-    return parseSearchResults(html);
+    const pageHtml = await fetchPage(searchUrl);
+    if (!pageHtml) return [];
+    return parseSearchResults(pageHtml);
   } catch (err) {
     console.error(`[BrowserSearch] ${err.message}`);
     return [];
@@ -1829,7 +1854,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.5",
+  version: "1.0.6",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
