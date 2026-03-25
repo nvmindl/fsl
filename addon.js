@@ -677,7 +677,26 @@ async function fetchPage(url, retries = 3) {
           redirect: isShortlink ? "manual" : "follow",
           signal: AbortSignal.timeout(12000),
         });
-        if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
+        if (isShortlink && !resp.ok && ![301, 302, 303, 307, 308].includes(resp.status)) {
+          console.log(`[Fetch] Shortlink got ${resp.status}, trying redirect:follow...`);
+          // Shortlink returned non-redirect error (e.g. 403 CF) — try following redirects
+          try {
+            const followResp = await fetch(url, {
+              headers: { ...HEADERS, Referer: url },
+              redirect: "follow",
+              signal: AbortSignal.timeout(12000),
+            });
+            if (followResp.ok) {
+              learnDomainFromUrl(followResp.url);
+              const followText = await followResp.text();
+              if (followText.length > 1000 && !followText.includes("Just a moment") && !followText.includes("Checking your browser")) {
+                console.log(`[Fetch] Shortlink follow OK (${followText.length} chars)`);
+                cacheSet(cache.page, url, followText);
+                return followText;
+              }
+            }
+          } catch {}
+        } else if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
           const location = resp.headers.get("location");
           if (location) {
             const redirectPath = new URL(location, url).pathname + new URL(location, url).search;
@@ -1839,6 +1858,11 @@ async function resolve(imdbId, type, season, episode) {
     if (!queries.includes(subtitle)) queries.push(subtitle); // subtitle
   }
 
+  // Start probe concurrently — for short titles like "Dark", search often
+  // fails but probe succeeds. Running in parallel saves 10-30s.
+  const probeSlug = slugify(info.title);
+  const probePromise = probeDirectUrls(probeSlug, info.year, type);
+
   let results = [];
   for (const q of queries) {
     results = await searchFasel(q, info.year, type);
@@ -1879,9 +1903,8 @@ async function resolve(imdbId, type, season, episode) {
   }
 
   if (results.length === 0) {
-    // Last resort: probe direct URLs (works for short titles like "Dark" that search misses)
-    const slug = slugify(info.title);
-    const probed = await probeDirectUrls(slug, info.year, type);
+    // Probe was started concurrently — await its result
+    const probed = await probePromise;
     if (probed.length > 0) {
       results = probed;
       console.log(`[Resolve] Direct URL probe found ${probed.length} result(s)`);
@@ -1978,7 +2001,13 @@ async function resolve(imdbId, type, season, episode) {
         if (activeMatch && activeMatch.url !== targetUrl) {
           console.log(`[Resolve] Season ${sn}: ${activeMatch.url}`);
           const seasonPage = await parseSeriesPage(activeMatch.url);
-          if (seasonPage.episodes.length > 0) episodes = seasonPage.episodes;
+          if (seasonPage.episodes.length > 0) {
+            episodes = seasonPage.episodes;
+          } else {
+            // Season page failed — clear episodes to avoid playing wrong season
+            console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
+            episodes = [];
+          }
         }
       }
     } else if (pickedFromSearch && episodes.length > 0) {
@@ -2024,7 +2053,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.12",
+  version: "1.0.13",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
