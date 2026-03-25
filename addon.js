@@ -313,9 +313,9 @@ const cache = {
   streams: new Map(), // "type/imdbId:s:e" → { json, ts } — /streams/ response cache
 };
 const IMDB_TTL = 24 * 60 * 60 * 1000;   // 24h
-const SEARCH_TTL = 15 * 60 * 1000;        // 15min
-const RESOLVE_TTL = 10 * 60 * 1000;       // 10min
-const STREAMS_TTL = 5 * 60 * 1000;        // 5min
+const SEARCH_TTL = 60 * 60 * 1000;        // 1h (survive CF block periods)
+const RESOLVE_TTL = 60 * 60 * 1000;       // 1h (streams for an episode don't change)
+const STREAMS_TTL = 30 * 60 * 1000;       // 30min
 
 function cacheGet(store, key, ttl) {
   const entry = store.get(key);
@@ -1608,8 +1608,11 @@ async function resolve(imdbId, type, season, episode) {
   const resolveKey = `${type}/${imdbId}:${season || ""}:${episode || ""}`;
   const cachedResolve = cacheGet(cache.resolve, resolveKey, RESOLVE_TTL);
   if (cachedResolve) {
-    console.log(`[Resolve] Cache hit: ${resolveKey} (${cachedResolve.length} streams)`);
-    return cachedResolve;
+    // Skip empty cached results after 2 min (retry), but keep successful results for full TTL
+    if (cachedResolve.length > 0 || Date.now() - cache.resolve.get(resolveKey).ts < 120000) {
+      console.log(`[Resolve] Cache hit: ${resolveKey} (${cachedResolve.length} streams)`);
+      return cachedResolve;
+    }
   }
   console.log(`[Resolve] ${type} ${imdbId} S${season || "-"}E${episode || "-"}`);
 
@@ -1694,6 +1697,8 @@ async function resolve(imdbId, type, season, episode) {
 
   if (results.length === 0) {
     console.log("[Resolve] Nothing found on FaselHD");
+    // Cache empty resolve for 2 min to prevent hammering when CF is blocking
+    cacheSet(cache.resolve, resolveKey, []);
     return [];
   }
 
@@ -1824,7 +1829,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.4",
+  version: "1.0.5",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
