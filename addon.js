@@ -1503,6 +1503,19 @@ function filterResultsByRelevance(results, title, year) {
   const noTheSlug = slugify(title.replace(/^the\s+/i, "").replace(/[.]/g, "")); // e.g. "oc"
   const words = titleSlug.split("-").filter(w => w.length > 1); // significant words
 
+  // Check if a slug appears as a complete segment in the URL path
+  // e.g. slugMatch("dark", "...-dark-sun-...") = false, slugMatch("dark", "...-dark-...") = true
+  // Uses word-boundary matching: slug must be surrounded by non-alphanumeric chars or start/end
+  function slugMatch(slug, text) {
+    const re = new RegExp("(^|[^a-z0-9])" + slug.replace(/[-]/g, "[-]") + "([^a-z0-9]|$)");
+    return re.test(text);
+  }
+
+  // Check if slug appears anywhere as substring (weaker match)
+  function slugContains(slug, text) {
+    return text.includes(slug);
+  }
+
   // Detect if results span both anime and non-anime categories
   const hasAnime = results.some(r => /\/anime\/|\/anime-episodes\//.test(r.url));
   const hasNonAnime = results.some(r => /\/seasons\/|\/series\/|\/asian-series\/|\/episodes\//.test(r.url));
@@ -1512,17 +1525,25 @@ function filterResultsByRelevance(results, title, year) {
     const decoded = decodeURIComponent(r.url).toLowerCase();
     let score = 0;
 
-    // Exact slug match in URL (strongest signal)
-    if (decoded.includes(titleSlug)) score += 100;
-    if (cleanedSlug !== titleSlug && decoded.includes(cleanedSlug)) score += 90;
-    if (noTheSlug !== cleanedSlug && decoded.includes(noTheSlug)) score += 80;
+    // Exact slug match with word boundaries (strongest signal)
+    // "dark" matches ".../مسلسل-dark-الموسم..." but NOT ".../مسلسل-dark-sun-..."
+    if (slugMatch(titleSlug, decoded)) score += 100;
+    else if (slugContains(titleSlug, decoded)) score += 40; // substring only — much weaker
+    if (cleanedSlug !== titleSlug) {
+      if (slugMatch(cleanedSlug, decoded)) score += 90;
+      else if (slugContains(cleanedSlug, decoded)) score += 35;
+    }
+    if (noTheSlug !== cleanedSlug) {
+      if (slugMatch(noTheSlug, decoded)) score += 80;
+      else if (slugContains(noTheSlug, decoded)) score += 30;
+    }
 
     // Year match
     if (year && decoded.includes(String(year))) score += 20;
 
     // Individual word matches (weaker)
     for (const w of words) {
-      if (decoded.includes(w)) score += 5;
+      if (decoded.includes(w)) score += 3;
     }
 
     // Anime vs live-action disambiguation: when both categories exist,
@@ -1539,7 +1560,7 @@ function filterResultsByRelevance(results, title, year) {
     const lastSeg = decoded.split("/").pop() || "";
     const segWords = lastSeg.replace(/[^a-z0-9-]/g, "").split("-").filter(w => w.length > 1);
     const extraWords = segWords.filter(w => !words.includes(w));
-    score -= extraWords.length * 2;
+    score -= extraWords.length * 3;
 
     return { ...r, score };
   });
