@@ -1296,22 +1296,46 @@ async function parseSeriesPage(url) {
 
 async function extractStreamFromPlayer(playerUrl) {
   const html = await fetchPage(playerUrl);
-  if (!html) return null;
+  if (!html) {
+    console.log(`[Extract] fetchPage returned null for ${playerUrl}`);
+    return null;
+  }
+  console.log(`[Extract] Got HTML (${html.length} chars) from ${playerUrl.substring(0, 80)}`);
+
+  // Quick check: is this a CF challenge page?
+  if (html.includes("Just a moment") || html.includes("Checking your browser")) {
+    console.log("[Extract] Got CF challenge page instead of player");
+    return null;
+  }
 
   const $ = cheerio.load(html);
 
   // Find the main obfuscated script (large, contains jwplayer)
   let mainScript = null;
+  const scriptSizes = [];
   $("script").each((_, el) => {
     const text = $(el).html() || "";
-    if (!$(el).attr("src") && text.length > 20000 && text.includes("jwplayer")) {
+    const src = $(el).attr("src") || "";
+    if (!src && text.length > 500) {
+      scriptSizes.push({ len: text.length, hasJw: text.includes("jwplayer"), preview: text.substring(0, 80) });
+    }
+    if (!src && text.length > 20000 && text.includes("jwplayer")) {
       mainScript = text;
     }
   });
+  console.log(`[Extract] Inline scripts >500 chars: ${JSON.stringify(scriptSizes.map(s => ({ len: s.len, hasJw: s.hasJw })))}`);
 
   if (!mainScript) {
-    console.log("[Extract] No main player script found");
-    return null;
+    console.log("[Extract] No main player script found (need >20000 chars + jwplayer)");
+    // Try relaxed: any script with jwplayer
+    $("script").each((_, el) => {
+      const text = $(el).html() || "";
+      if (!$(el).attr("src") && text.includes("jwplayer") && text.length > 5000 && !mainScript) {
+        mainScript = text;
+        console.log(`[Extract] Relaxed match: found jwplayer script (${text.length} chars)`);
+      }
+    });
+    if (!mainScript) return null;
   }
   console.log(`[Extract] Found player script (${mainScript.length} chars)`);
 
@@ -1438,12 +1462,14 @@ async function extractStreamFromPlayer(playerUrl) {
 
   try {
     vm.runInContext(`try{${mainScript}}catch(_e_){}`, sandbox, { timeout: 10000, filename: "player.js" });
+    console.log(`[Extract] VM completed OK`);
   } catch (e) {
     console.log(`[Extract] VM error: ${e.message}`);
   }
 
   // Allow any scheduled timers to fire
   await new Promise(r => setTimeout(r, 200));
+  console.log(`[Extract] capturedConfig: ${capturedConfig ? JSON.stringify(Object.keys(capturedConfig)) : "null"}`);
 
   if (capturedConfig) {
     let streamUrl = null;
@@ -1836,6 +1862,7 @@ async function resolve(imdbId, type, season, episode) {
 
   // Get player_token URLs from the page
   const players = await getPlayerTokens(targetUrl);
+  console.log(`[Resolve] Players: ${JSON.stringify(players.map(p => ({ url: p.url.substring(0, 60), name: p.name })))}`);
 
   // Extract streams from all servers IN PARALLEL
   const extractions = await Promise.allSettled(
@@ -1843,6 +1870,7 @@ async function resolve(imdbId, type, season, episode) {
   );
   for (const r of extractions) {
     if (r.status === "fulfilled" && r.value) streams.push(r.value);
+    else if (r.status === "rejected") console.log(`[Resolve] Extraction rejected: ${r.reason?.message || r.reason}`);
   }
 
   console.log(`[Resolve] ${streams.length} stream(s)`);
