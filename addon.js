@@ -3,6 +3,24 @@ const cheerio = require("cheerio");
 const vm = require("vm");
 require("dotenv").config();
 
+// ── Diagnostic log ring buffer ──
+const LOG_BUFFER_SIZE = 200;
+const logBuffer = [];
+const origLog = console.log.bind(console);
+const origErr = console.error.bind(console);
+console.log = (...args) => {
+  const line = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+  logBuffer.push(`${new Date().toISOString().substring(11,23)} ${line}`);
+  if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+  origLog(...args);
+};
+console.error = (...args) => {
+  const line = args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+  logBuffer.push(`${new Date().toISOString().substring(11,23)} ERR ${line}`);
+  if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+  origErr(...args);
+};
+
 // ── Puppeteer Browser (CF bypass) — auto-close after idle to save memory ──
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 let browserInstance = null;
@@ -1882,7 +1900,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.6",
+  version: "1.0.7",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
@@ -2451,6 +2469,13 @@ const server = http.createServer(async (req, res) => {
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(info, null, 2));
+    return;
+  }
+
+  // Diagnostic log endpoint
+  if (req.url === "/lastlog") {
+    res.writeHead(200, { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" });
+    res.end(logBuffer.join("\n"));
     return;
   }
 
