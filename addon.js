@@ -1153,8 +1153,8 @@ async function searchFasel(query, year, type) {
     }
   }
 
-  // Strategy 2: Sitemap search (fallback — but skip if AJAX is CF-blocked since sitemaps use HTTP too)
-  if (!results.length && !isAjaxBlocked()) {
+  // Strategy 2: Sitemap search (fallback — sitemaps are static XML, often work even when AJAX is CF-blocked)
+  if (!results.length) {
     if (type === "movie") {
       results = await searchSitemaps(domain, "movies", 14, slug, year);
     } else if (type === "series") {
@@ -1712,6 +1712,47 @@ function filterResultsByRelevance(results, title, year) {
 
 // ── Main resolver ──
 
+// Direct URL probe: construct expected FaselHD URLs and check if they exist.
+// Used as last resort when search + filter both fail (e.g. short titles like "Dark").
+async function probeDirectUrls(slug, year, type) {
+  const domain = activeDomain || MAIN_DOMAIN;
+  // FaselHD URL patterns: /seasons/مسلسل-{slug}, /movies/فيلم-{slug}-{year}-مترجم, etc.
+  const candidates = [];
+  if (type === "series") {
+    candidates.push(`${domain}/seasons/%d9%85%d8%b3%d9%84%d8%b3%d9%84-${slug}`);
+    candidates.push(`${domain}/series/%d9%85%d8%b3%d9%84%d8%b3%d9%84-${slug}`);
+    candidates.push(`${domain}/anime/%d8%a7%d9%86%d9%85%d9%8a-${slug}`);
+  } else if (type === "movie") {
+    if (year) candidates.push(`${domain}/movies/%d9%81%d9%8a%d9%84%d9%85-${slug}-${year}-%d9%85%d8%aa%d8%b1%d8%ac%d9%85`);
+    candidates.push(`${domain}/movies/%d9%81%d9%8a%d9%84%d9%85-${slug}-%d9%85%d8%aa%d8%b1%d8%ac%d9%85`);
+    if (year) candidates.push(`${domain}/hindi/%d9%81%d9%8a%d9%84%d9%85-${slug}-${year}-%d9%85%d8%aa%d8%b1%d8%ac%d9%85`);
+  }
+  if (!candidates.length) return [];
+
+  console.log(`[Probe] Trying ${candidates.length} direct URLs for "${slug}"`);
+  const results = [];
+  // Probe in parallel with short timeout
+  const probes = candidates.map(url =>
+    fetch(url, {
+      headers: { ...HEADERS, ...(getCfCookies(url) ? { Cookie: getCfCookies(url) } : {}) },
+      redirect: "follow",
+      signal: AbortSignal.timeout(8000),
+    }).then(async resp => {
+      if (!resp.ok) return;
+      const html = await resp.text();
+      if (html.length > 2000 && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
+        // Verify it's a content page (has player or episode links)
+        if (html.includes("player_token") || html.includes("seasonDiv") || html.includes("epAll")) {
+          console.log(`[Probe] HIT: ${url} (${html.length} chars)`);
+          results.push({ url: resp.url || url, title: "" });
+        }
+      }
+    }).catch(() => {})
+  );
+  await Promise.all(probes);
+  return results;
+}
+
 async function resolve(imdbId, type, season, episode) {
   const resolveKey = `${type}/${imdbId}:${season || ""}:${episode || ""}`;
   const cachedResolve = cacheGet(cache.resolve, resolveKey, RESOLVE_TTL);
@@ -1800,6 +1841,16 @@ async function resolve(imdbId, type, season, episode) {
           if (f.length) results = f;
         }
       }
+    }
+  }
+
+  if (results.length === 0) {
+    // Last resort: probe direct URLs (works for short titles like "Dark" that search misses)
+    const slug = slugify(info.title);
+    const probed = await probeDirectUrls(slug, info.year, type);
+    if (probed.length > 0) {
+      results = probed;
+      console.log(`[Resolve] Direct URL probe found ${probed.length} result(s)`);
     }
   }
 
@@ -1939,7 +1990,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.8",
+  version: "1.0.9",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
