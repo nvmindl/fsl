@@ -110,15 +110,6 @@ function withBrowserLock(fn) {
   return p;
 }
 
-// ── HTTP CF-block tracker ──
-// When plain HTTP returns 403, skip it and use fastFetch/browser only
-let httpBlockedUntil = 0;
-function markHttpBlocked() {
-  httpBlockedUntil = Date.now() + 120000;
-  console.log(`[Fetch] HTTP blocked by CF, skipping plain HTTP for 120s`);
-}
-function isHttpBlocked() { return Date.now() < httpBlockedUntil; }
-
 // ── CF Cookie Cache ──
 // After Puppeteer bypasses CF, we extract cookies and reuse them with fast HTTP fetch
 let cfCookies = ""; // "cf_clearance=...; __cf_bm=..." etc.
@@ -133,7 +124,6 @@ async function extractCfCookies(page) {
       cfCookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
       cfCookiesDomain = new URL(page.url()).hostname;
       cfCookiesTs = Date.now();
-      httpBlockedUntil = 0; // CF cookies obtained, HTTP should work now
       const cfCount = cookies.filter(c => c.name.startsWith("cf_") || c.name.startsWith("__cf")).length;
       console.log(`[CF] Cached ${cookies.length} cookie(s) (${cfCount} CF) for ${cfCookiesDomain}`);
     }
@@ -674,43 +664,17 @@ async function fetchPage(url, retries = 2) {
       return fastHtml;
     }
 
-    // Step 2: Try plain HTTP once (skip entirely if CF is known-blocking)
-    if (!isHttpBlocked()) {
+    // Step 2: Try plain HTTP (skip shortlinks — they always 403 without CF cookies)
+    const isShortlink = /[?&]p=\d+/.test(url);
+    if (!isShortlink) {
       try {
-        const isShortlink = /[?&]p=\d+/.test(url);
         console.log(`[Fetch] HTTP ${url.substring(0, 80)}`);
         const resp = await fetch(url, {
           headers: { ...HEADERS, Referer: url },
-          redirect: isShortlink ? "manual" : "follow",
+          redirect: "follow",
           signal: AbortSignal.timeout(10000),
         });
-        if (resp.status === 403) {
-          markHttpBlocked();
-        } else if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
-          const location = resp.headers.get("location");
-          if (location) {
-            const redirectPath = new URL(location, url).pathname + new URL(location, url).search;
-            const domain = activeDomain || MAIN_DOMAIN;
-            const rewrittenUrl = `${domain}${redirectPath}`;
-            console.log(`[Fetch] Shortlink redirect → ${rewrittenUrl.substring(0, 80)}`);
-            const retryResp = await fetch(rewrittenUrl, {
-              headers: { ...HEADERS, Referer: rewrittenUrl },
-              redirect: "follow",
-              signal: AbortSignal.timeout(10000),
-            });
-            if (retryResp.ok) {
-              learnDomainFromUrl(retryResp.url);
-              const retryText = await retryResp.text();
-              if (retryText.length > 1000 && !retryText.includes("Just a moment")) {
-                console.log(`[Fetch] Shortlink OK (${retryText.length} chars)`);
-                cacheSet(cache.page, url, retryText);
-                return retryText;
-              }
-            } else if (retryResp.status === 403) {
-              markHttpBlocked();
-            }
-          }
-        } else if (resp.ok) {
+        if (resp.ok) {
           const finalHost = new URL(resp.url).hostname;
           if (finalHost.includes("fasel-hd.cam")) {
             markDomainBad();
@@ -739,7 +703,6 @@ async function fetchPage(url, retries = 2) {
             if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
               console.log(`[Fetch] HTTP OK (${text.length} chars)`);
               cacheSet(cache.page, url, text);
-              httpBlockedUntil = 0; // HTTP works, clear block
               return text;
             }
           }
@@ -747,8 +710,6 @@ async function fetchPage(url, retries = 2) {
       } catch (err) {
         console.log(`[Fetch] HTTP error: ${err.message}`);
       }
-    } else {
-      console.log(`[Fetch] HTTP blocked, skipping: ${url.substring(0, 80)}`);
     }
 
     // Step 3: Check cache (concurrent probe may have populated it)
@@ -760,7 +721,6 @@ async function fetchPage(url, retries = 2) {
     const html = await browserFetch(url);
     if (html && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
       cacheSet(cache.page, url, html);
-      httpBlockedUntil = 0; // Browser got CF cookies, HTTP may work now
       return html;
     }
     return null;
@@ -1995,17 +1955,20 @@ async function resolve(imdbId, type, season, episode) {
       // No episodes on current page — need to navigate to season
       const match = seasons.find((s) => s.num === sn);
       if (match) {
-        console.log(`[Resolve] Season ${sn}: ${match.url}`);
-        const seasonPage = await parseSeriesPage(match.url);
-        episodes = seasonPage.episodes;
-        // If shortlink failed, try direct season URL
-        if (episodes.length === 0) {
-          const directUrl = buildSeasonUrl(targetUrl, sn);
-          if (directUrl) {
-            console.log(`[Resolve] Shortlink failed, trying direct: ${directUrl.substring(0, 80)}`);
-            const directPage = await parseSeriesPage(directUrl);
+        // Try direct season URL first (works with fastFetch, no browser needed)
+        const directUrl = buildSeasonUrl(targetUrl, sn);
+        if (directUrl) {
+          console.log(`[Resolve] Season ${sn} direct: ${directUrl.substring(0, 80)}`);
+          const directPage = await parseSeriesPage(directUrl);
+          if (directPage.episodes.length > 0) {
             episodes = directPage.episodes;
           }
+        }
+        // Fall back to shortlink if direct URL didn't work
+        if (episodes.length === 0) {
+          console.log(`[Resolve] Season ${sn} shortlink: ${match.url}`);
+          const seasonPage = await parseSeriesPage(match.url);
+          episodes = seasonPage.episodes;
         }
       } else {
         console.log(`[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`);
@@ -2016,22 +1979,22 @@ async function resolve(imdbId, type, season, episode) {
       if (match) {
         const activeMatch = seasons.find((s) => s.num === sn);
         if (activeMatch && activeMatch.url !== targetUrl) {
-          console.log(`[Resolve] Season ${sn}: ${activeMatch.url}`);
-          const seasonPage = await parseSeriesPage(activeMatch.url);
-          if (seasonPage.episodes.length > 0) {
-            episodes = seasonPage.episodes;
-          } else {
-            // Shortlink failed — try direct season URL before giving up
-            const directUrl = buildSeasonUrl(targetUrl, sn);
-            if (directUrl) {
-              console.log(`[Resolve] Shortlink failed, trying direct: ${directUrl.substring(0, 80)}`);
-              const directPage = await parseSeriesPage(directUrl);
-              if (directPage.episodes.length > 0) {
-                episodes = directPage.episodes;
-              } else {
-                console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
-                episodes = [];
-              }
+          // Try direct season URL first
+          const directUrl = buildSeasonUrl(targetUrl, sn);
+          let resolved = false;
+          if (directUrl) {
+            console.log(`[Resolve] Season ${sn} direct: ${directUrl.substring(0, 80)}`);
+            const directPage = await parseSeriesPage(directUrl);
+            if (directPage.episodes.length > 0) {
+              episodes = directPage.episodes;
+              resolved = true;
+            }
+          }
+          if (!resolved) {
+            console.log(`[Resolve] Season ${sn} shortlink: ${activeMatch.url}`);
+            const seasonPage = await parseSeriesPage(activeMatch.url);
+            if (seasonPage.episodes.length > 0) {
+              episodes = seasonPage.episodes;
             } else {
               console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
               episodes = [];
@@ -2082,7 +2045,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.15",
+  version: "1.0.16",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
