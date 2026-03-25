@@ -1503,12 +1503,16 @@ function filterResultsByRelevance(results, title, year) {
   const noTheSlug = slugify(title.replace(/^the\s+/i, "").replace(/[.]/g, "")); // e.g. "oc"
   const words = titleSlug.split("-").filter(w => w.length > 1); // significant words
 
-  // Check if a slug appears as a complete segment in the URL path
-  // e.g. slugMatch("dark", "...-dark-sun-...") = false, slugMatch("dark", "...-dark-...") = true
-  // Uses word-boundary matching: slug must be surrounded by non-alphanumeric chars or start/end
+  // Extract contiguous Latin (a-z0-9) word groups from text.
+  // Arabic/non-Latin chars act as natural boundaries, splitting title from noise.
+  // e.g. "مسلسل-dark-الموسم" → ["dark"], "مسلسل-dark-sun-الموسم" → ["dark-sun"]
+  function extractLatinSlugs(text) {
+    return (text.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) || []);
+  }
+
+  // Exact Latin segment match: "dark" matches only if it's a standalone Latin group
   function slugMatch(slug, text) {
-    const re = new RegExp("(^|[^a-z0-9])" + slug.replace(/[-]/g, "[-]") + "([^a-z0-9]|$)");
-    return re.test(text);
+    return extractLatinSlugs(text).includes(slug);
   }
 
   // Check if slug appears anywhere as substring (weaker match)
