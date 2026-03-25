@@ -1572,19 +1572,25 @@ function filterResultsByRelevance(results, title, year) {
   // Sort by score descending
   scored.sort((a, b) => b.score - a.score);
 
-  // Log top 3 for debugging
-  const top3 = scored.slice(0, 3).map(r => {
-    const seg = decodeURIComponent(r.url).split("/").pop() || "";
-    return `${seg.substring(0, 50)}=${r.score}`;
+  // Log all scored results for debugging
+  console.log(`[Filter] ${results.length} results for slug="${titleSlug}":`);
+  scored.forEach((r, i) => {
+    const decoded = decodeURIComponent(r.url);
+    const path = decoded.split("/").slice(3).join("/"); // strip domain
+    const latinSegs = extractLatinSlugs(decoded.toLowerCase());
+    const titleSeg = latinSegs.filter(s => s !== "https" && !s.includes("faselhdx") && !s.includes("web") && s !== "seasons" && s !== "series" && s !== "movies" && s !== "episodes" && s !== "anime");
+    console.log(`  ${i}: score=${r.score} latin=[${titleSeg.join(",")}] path=/${path.substring(0, 80)}`);
   });
-  console.log(`[Filter] ${results.length} results, top: ${top3.join(" | ")}`);
 
   // Require minimum score of 60 (= at least one exact slugMatch hit).
   // Below that, we only have weak substring matches — better to return empty
   // than deliver wrong content (e.g. "dark-sun" when searching "dark").
   const MIN_SCORE = 60;
   const relevant = scored.filter(r => r.score >= MIN_SCORE);
-  if (relevant.length > 0) return relevant;
+  if (relevant.length > 0) {
+    console.log(`[Filter] → ${relevant.length} above threshold (top score=${relevant[0].score})`);
+    return relevant;
+  }
 
   // Fallback: if nothing above threshold, return empty to avoid wrong matches
   console.log(`[Filter] No result above threshold ${MIN_SCORE}, returning empty`);
