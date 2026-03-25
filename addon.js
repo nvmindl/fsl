@@ -110,6 +110,15 @@ function withBrowserLock(fn) {
   return p;
 }
 
+// ── HTTP CF-block tracker ──
+// When plain HTTP returns 403, skip it and use fastFetch/browser only
+let httpBlockedUntil = 0;
+function markHttpBlocked() {
+  httpBlockedUntil = Date.now() + 120000;
+  console.log(`[Fetch] HTTP blocked by CF, skipping plain HTTP for 120s`);
+}
+function isHttpBlocked() { return Date.now() < httpBlockedUntil; }
+
 // ── CF Cookie Cache ──
 // After Puppeteer bypasses CF, we extract cookies and reuse them with fast HTTP fetch
 let cfCookies = ""; // "cf_clearance=...; __cf_bm=..." etc.
@@ -124,6 +133,7 @@ async function extractCfCookies(page) {
       cfCookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
       cfCookiesDomain = new URL(page.url()).hostname;
       cfCookiesTs = Date.now();
+      httpBlockedUntil = 0; // CF cookies obtained, HTTP should work now
       const cfCount = cookies.filter(c => c.name.startsWith("cf_") || c.name.startsWith("__cf")).length;
       console.log(`[CF] Cached ${cookies.length} cookie(s) (${cfCount} CF) for ${cfCookiesDomain}`);
     }
@@ -647,7 +657,7 @@ const HEADERS = {
   "Cache-Control": "max-age=0",
 };
 
-async function fetchPage(url, retries = 3) {
+async function fetchPage(url, retries = 2) {
   // Short-lived page cache — avoids re-fetching same URL within 2 min
   const pageCached = cacheGet(cache.page, url, 120000);
   if (pageCached) {
@@ -655,94 +665,68 @@ async function fetchPage(url, retries = 3) {
     return pageCached;
   }
 
-  // For FaselHD: try HTTP multiple times FIRST (fast), only browser as last resort.
-  // Browser fallback wastes 30-45s on CF timeouts, but HTTP retry 2 often succeeds.
   if (isFaselUrl(url)) {
-    for (let i = 0; i < retries; i++) {
-      // Re-check cache (concurrent probe may have cached this URL)
-      if (i > 0) {
-        const mid = cacheGet(cache.page, url, 120000);
-        if (mid) { console.log(`[Fetch] Page cache hit (${mid.length} chars)`); return mid; }
-      }
-      console.log(`[Fetch] HTTP (${i + 1}/${retries}) ${url.substring(0, 80)}`);
+    // Step 1: Try fastFetch (uses CF cookies from browser sessions — instant when available)
+    const fastHtml = await fastFetch(url);
+    if (fastHtml) {
+      console.log(`[Fetch] Fast fetch OK (${fastHtml.length} chars)`);
+      cacheSet(cache.page, url, fastHtml);
+      return fastHtml;
+    }
 
-      // Try fast HTTP fetch with cached CF cookies first
-      const fastHtml = await fastFetch(url);
-      if (fastHtml) {
-        console.log(`[Fetch] Fast fetch OK (${fastHtml.length} chars)`);
-        cacheSet(cache.page, url, fastHtml);
-        return fastHtml;
-      }
-
-      // Try plain HTTP with redirect following
+    // Step 2: Try plain HTTP once (skip entirely if CF is known-blocking)
+    if (!isHttpBlocked()) {
       try {
         const isShortlink = /[?&]p=\d+/.test(url);
+        console.log(`[Fetch] HTTP ${url.substring(0, 80)}`);
         const resp = await fetch(url, {
           headers: { ...HEADERS, Referer: url },
           redirect: isShortlink ? "manual" : "follow",
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(10000),
         });
-        if (isShortlink && !resp.ok && ![301, 302, 303, 307, 308].includes(resp.status)) {
-          console.log(`[Fetch] Shortlink got ${resp.status}, trying redirect:follow...`);
-          // Shortlink returned non-redirect error (e.g. 403 CF) — try following redirects
-          try {
-            const followResp = await fetch(url, {
-              headers: { ...HEADERS, Referer: url },
-              redirect: "follow",
-              signal: AbortSignal.timeout(12000),
-            });
-            if (followResp.ok) {
-              learnDomainFromUrl(followResp.url);
-              const followText = await followResp.text();
-              if (followText.length > 1000 && !followText.includes("Just a moment") && !followText.includes("Checking your browser")) {
-                console.log(`[Fetch] Shortlink follow OK (${followText.length} chars)`);
-                cacheSet(cache.page, url, followText);
-                return followText;
-              }
-            }
-          } catch {}
+        if (resp.status === 403) {
+          markHttpBlocked();
         } else if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
           const location = resp.headers.get("location");
           if (location) {
             const redirectPath = new URL(location, url).pathname + new URL(location, url).search;
             const domain = activeDomain || MAIN_DOMAIN;
             const rewrittenUrl = `${domain}${redirectPath}`;
-            console.log(`[Fetch] Shortlink redirect → rewriting to ${rewrittenUrl}`);
+            console.log(`[Fetch] Shortlink redirect → ${rewrittenUrl.substring(0, 80)}`);
             const retryResp = await fetch(rewrittenUrl, {
               headers: { ...HEADERS, Referer: rewrittenUrl },
               redirect: "follow",
-              signal: AbortSignal.timeout(12000),
+              signal: AbortSignal.timeout(10000),
             });
             if (retryResp.ok) {
               learnDomainFromUrl(retryResp.url);
               const retryText = await retryResp.text();
-              if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
-                console.log(`[Fetch] Shortlink rewrite OK (${retryText.length} chars)`);
+              if (retryText.length > 1000 && !retryText.includes("Just a moment")) {
+                console.log(`[Fetch] Shortlink OK (${retryText.length} chars)`);
                 cacheSet(cache.page, url, retryText);
                 return retryText;
               }
+            } else if (retryResp.status === 403) {
+              markHttpBlocked();
             }
           }
         } else if (resp.ok) {
           const finalHost = new URL(resp.url).hostname;
           if (finalHost.includes("fasel-hd.cam")) {
-            console.log(`[Fetch] Redirected to CF-protected ${finalHost}, re-discovering domain...`);
             markDomainBad();
             const newDomain = await getDomain();
             if (newDomain !== MAIN_DOMAIN) {
               const newUrl = url.replace(/https?:\/\/[^/]+/, newDomain);
               if (newUrl !== url) {
-                console.log(`[Fetch] Retrying with new domain: ${newUrl}`);
                 const retryResp = await fetch(newUrl, {
                   headers: { ...HEADERS, Referer: newUrl },
                   redirect: "follow",
-                  signal: AbortSignal.timeout(12000),
+                  signal: AbortSignal.timeout(10000),
                 });
                 if (retryResp.ok) {
                   learnDomainFromUrl(retryResp.url);
                   const retryText = await retryResp.text();
-                  if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
-                    console.log(`[Fetch] Retry OK (${retryText.length} chars)`);
+                  if (retryText.length > 1000 && !retryText.includes("Just a moment")) {
                     cacheSet(cache.page, newUrl, retryText);
                     return retryText;
                   }
@@ -755,6 +739,7 @@ async function fetchPage(url, retries = 3) {
             if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
               console.log(`[Fetch] HTTP OK (${text.length} chars)`);
               cacheSet(cache.page, url, text);
+              httpBlockedUntil = 0; // HTTP works, clear block
               return text;
             }
           }
@@ -762,22 +747,20 @@ async function fetchPage(url, retries = 3) {
       } catch (err) {
         console.log(`[Fetch] HTTP error: ${err.message}`);
       }
-
-      // Brief pause before retry (let CF rate-limit clear)
-      if (i < retries - 1) await new Promise(r => setTimeout(r, 1000));
+    } else {
+      console.log(`[Fetch] HTTP blocked, skipping: ${url.substring(0, 80)}`);
     }
 
-    // Check cache before expensive browser fallback (concurrent probe may have cached it)
-    const preBrowser = cacheGet(cache.page, url, 120000);
-    if (preBrowser) {
-      console.log(`[Fetch] Page cache hit (${preBrowser.length} chars)`);
-      return preBrowser;
-    }
-    // ALL HTTP retries exhausted — last resort: browser
-    console.log(`[Fetch] All HTTP failed, browser fallback: ${url.substring(0, 80)}`);
+    // Step 3: Check cache (concurrent probe may have populated it)
+    const mid = cacheGet(cache.page, url, 120000);
+    if (mid) { console.log(`[Fetch] Page cache hit (${mid.length} chars)`); return mid; }
+
+    // Step 4: Browser fallback
+    console.log(`[Fetch] Browser fallback: ${url.substring(0, 80)}`);
     const html = await browserFetch(url);
     if (html && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
       cacheSet(cache.page, url, html);
+      httpBlockedUntil = 0; // Browser got CF cookies, HTTP may work now
       return html;
     }
     return null;
@@ -1333,6 +1316,23 @@ function pickSeasonResult(results, seasonNum) {
 }
 
 // Parse a series page: extract season URLs and episode URLs
+// Arabic ordinal names for constructing direct season URLs
+const ARABIC_SEASON_NAMES = [
+  "", "الأول", "الثاني", "الثالث", "الرابع", "الخامس",
+  "السادس", "السابع", "الثامن", "التاسع", "العاشر",
+];
+
+// Construct direct season page URL from show page URL + season number
+// e.g. /seasons/مسلسل-dark + season 1 → /seasons/مسلسل-dark-الموسم-الأول
+function buildSeasonUrl(showUrl, seasonNum) {
+  if (seasonNum < 1 || seasonNum > 10) return null;
+  const arabicName = ARABIC_SEASON_NAMES[seasonNum];
+  if (!arabicName) return null;
+  // Strip trailing slash
+  const base = showUrl.replace(/\/$/, "");
+  return `${base}-الموسم-${arabicName}`;
+}
+
 async function parseSeriesPage(url) {
   const html = await fetchPage(url);
   if (!html) return { seasons: [], episodes: [] };
@@ -1998,26 +1998,44 @@ async function resolve(imdbId, type, season, episode) {
         console.log(`[Resolve] Season ${sn}: ${match.url}`);
         const seasonPage = await parseSeriesPage(match.url);
         episodes = seasonPage.episodes;
+        // If shortlink failed, try direct season URL
+        if (episodes.length === 0) {
+          const directUrl = buildSeasonUrl(targetUrl, sn);
+          if (directUrl) {
+            console.log(`[Resolve] Shortlink failed, trying direct: ${directUrl.substring(0, 80)}`);
+            const directPage = await parseSeriesPage(directUrl);
+            episodes = directPage.episodes;
+          }
+        }
       } else {
         console.log(`[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`);
       }
     } else if (seasons.length > 1 && !pickedFromSearch) {
       // Episodes shown but check if we're on the right season
-      // Skip if we already picked the correct season page from search results
       const match = seasons.find((s) => s.num === sn);
       if (match) {
-        // Check if the current page is already for this season
         const activeMatch = seasons.find((s) => s.num === sn);
-        // Only re-fetch if a different season URL
         if (activeMatch && activeMatch.url !== targetUrl) {
           console.log(`[Resolve] Season ${sn}: ${activeMatch.url}`);
           const seasonPage = await parseSeriesPage(activeMatch.url);
           if (seasonPage.episodes.length > 0) {
             episodes = seasonPage.episodes;
           } else {
-            // Season page failed — clear episodes to avoid playing wrong season
-            console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
-            episodes = [];
+            // Shortlink failed — try direct season URL before giving up
+            const directUrl = buildSeasonUrl(targetUrl, sn);
+            if (directUrl) {
+              console.log(`[Resolve] Shortlink failed, trying direct: ${directUrl.substring(0, 80)}`);
+              const directPage = await parseSeriesPage(directUrl);
+              if (directPage.episodes.length > 0) {
+                episodes = directPage.episodes;
+              } else {
+                console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
+                episodes = [];
+              }
+            } else {
+              console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
+              episodes = [];
+            }
           }
         }
       }
@@ -2064,7 +2082,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.14",
+  version: "1.0.15",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
