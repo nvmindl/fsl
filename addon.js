@@ -647,7 +647,7 @@ const HEADERS = {
   "Cache-Control": "max-age=0",
 };
 
-async function fetchPage(url, retries = 2) {
+async function fetchPage(url, retries = 3) {
   // Short-lived page cache — avoids re-fetching same URL within 2 min
   const pageCached = cacheGet(cache.page, url, 120000);
   if (pageCached) {
@@ -655,109 +655,120 @@ async function fetchPage(url, retries = 2) {
     return pageCached;
   }
 
-  for (let i = 0; i < retries; i++) {
-    try {
-      console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
+  // For FaselHD: try HTTP multiple times FIRST (fast), only browser as last resort.
+  // Browser fallback wastes 30-45s on CF timeouts, but HTTP retry 2 often succeeds.
+  if (isFaselUrl(url)) {
+    for (let i = 0; i < retries; i++) {
+      console.log(`[Fetch] HTTP (${i + 1}/${retries}) ${url.substring(0, 80)}`);
 
-      let html;
-      if (isFaselUrl(url)) {
-        // Try fast HTTP fetch with cached CF cookies first
-        html = await fastFetch(url);
-        if (html) {
-          console.log(`[Fetch] Fast fetch OK (${html.length} chars)`);
-          cacheSet(cache.page, url, html);
-          return html;
-        }
+      // Try fast HTTP fetch with cached CF cookies first
+      const fastHtml = await fastFetch(url);
+      if (fastHtml) {
+        console.log(`[Fetch] Fast fetch OK (${fastHtml.length} chars)`);
+        cacheSet(cache.page, url, fastHtml);
+        return fastHtml;
+      }
 
-        // Try plain HTTP with redirect following (works on non-CF subdomains)
-        try {
-          // Use manual redirect for ?p= shortlinks to intercept CF-domain redirects
-          const isShortlink = /[?&]p=\d+/.test(url);
-          const resp = await fetch(url, {
-            headers: { ...HEADERS, Referer: url },
-            redirect: isShortlink ? "manual" : "follow",
-            signal: AbortSignal.timeout(12000),
-          });
-          if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
-            // Shortlink redirect — rewrite target to working domain (don't mark domain bad)
-            const location = resp.headers.get("location");
-            if (location) {
-              const redirectPath = new URL(location, url).pathname + new URL(location, url).search;
-              const domain = activeDomain || MAIN_DOMAIN;
-              const rewrittenUrl = `${domain}${redirectPath}`;
-              console.log(`[Fetch] Shortlink redirect → rewriting to ${rewrittenUrl}`);
-              // Fetch the rewritten URL with redirect follow
-              const retryResp = await fetch(rewrittenUrl, {
-                headers: { ...HEADERS, Referer: rewrittenUrl },
-                redirect: "follow",
-                signal: AbortSignal.timeout(12000),
-              });
-              if (retryResp.ok) {
-                learnDomainFromUrl(retryResp.url);
-                const retryText = await retryResp.text();
-                if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
-                  console.log(`[Fetch] Shortlink rewrite OK (${retryText.length} chars)`);
-                  cacheSet(cache.page, url, retryText);
-                  return retryText;
-                }
-              }
-            }
-          } else if (resp.ok) {
-            // Check if we got redirected to a dead/CF domain
-            const finalHost = new URL(resp.url).hostname;
-            if (finalHost.includes("fasel-hd.cam")) {
-              console.log(`[Fetch] Redirected to CF-protected ${finalHost}, re-discovering domain...`);
-              markDomainBad();
-              const newDomain = await getDomain();
-              // Rewrite URL to new domain and retry
-              if (newDomain !== MAIN_DOMAIN) {
-                const newUrl = url.replace(/https?:\/\/[^/]+/, newDomain);
-                if (newUrl !== url) {
-                  console.log(`[Fetch] Retrying with new domain: ${newUrl}`);
-                  const retryResp = await fetch(newUrl, {
-                    headers: { ...HEADERS, Referer: newUrl },
-                    redirect: "follow",
-                    signal: AbortSignal.timeout(12000),
-                  });
-                  if (retryResp.ok) {
-                    learnDomainFromUrl(retryResp.url);
-                    const retryText = await retryResp.text();
-                    if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
-                      console.log(`[Fetch] Retry OK (${retryText.length} chars)`);
-                      cacheSet(cache.page, newUrl, retryText);
-                      return retryText;
-                    }
-                  }
-                }
-              }
-            } else {
-              learnDomainFromUrl(resp.url);
-              const text = await resp.text();
-              if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
-                console.log(`[Fetch] HTTP follow-redirect OK (${text.length} chars)`);
-                cacheSet(cache.page, url, text);
-                return text;
+      // Try plain HTTP with redirect following
+      try {
+        const isShortlink = /[?&]p=\d+/.test(url);
+        const resp = await fetch(url, {
+          headers: { ...HEADERS, Referer: url },
+          redirect: isShortlink ? "manual" : "follow",
+          signal: AbortSignal.timeout(12000),
+        });
+        if (isShortlink && [301, 302, 303, 307, 308].includes(resp.status)) {
+          const location = resp.headers.get("location");
+          if (location) {
+            const redirectPath = new URL(location, url).pathname + new URL(location, url).search;
+            const domain = activeDomain || MAIN_DOMAIN;
+            const rewrittenUrl = `${domain}${redirectPath}`;
+            console.log(`[Fetch] Shortlink redirect → rewriting to ${rewrittenUrl}`);
+            const retryResp = await fetch(rewrittenUrl, {
+              headers: { ...HEADERS, Referer: rewrittenUrl },
+              redirect: "follow",
+              signal: AbortSignal.timeout(12000),
+            });
+            if (retryResp.ok) {
+              learnDomainFromUrl(retryResp.url);
+              const retryText = await retryResp.text();
+              if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
+                console.log(`[Fetch] Shortlink rewrite OK (${retryText.length} chars)`);
+                cacheSet(cache.page, url, retryText);
+                return retryText;
               }
             }
           }
-        } catch {}
-
-        // Fall back to Puppeteer
-        html = await browserFetch(url);
-      } else {
-        const resp = await fetch(url, {
-          headers: { ...HEADERS, Referer: url },
-          signal: AbortSignal.timeout(10000),
-        });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        html = await resp.text();
+        } else if (resp.ok) {
+          const finalHost = new URL(resp.url).hostname;
+          if (finalHost.includes("fasel-hd.cam")) {
+            console.log(`[Fetch] Redirected to CF-protected ${finalHost}, re-discovering domain...`);
+            markDomainBad();
+            const newDomain = await getDomain();
+            if (newDomain !== MAIN_DOMAIN) {
+              const newUrl = url.replace(/https?:\/\/[^/]+/, newDomain);
+              if (newUrl !== url) {
+                console.log(`[Fetch] Retrying with new domain: ${newUrl}`);
+                const retryResp = await fetch(newUrl, {
+                  headers: { ...HEADERS, Referer: newUrl },
+                  redirect: "follow",
+                  signal: AbortSignal.timeout(12000),
+                });
+                if (retryResp.ok) {
+                  learnDomainFromUrl(retryResp.url);
+                  const retryText = await retryResp.text();
+                  if (retryText.length > 1000 && !retryText.includes("Just a moment") && !retryText.includes("Checking your browser")) {
+                    console.log(`[Fetch] Retry OK (${retryText.length} chars)`);
+                    cacheSet(cache.page, newUrl, retryText);
+                    return retryText;
+                  }
+                }
+              }
+            }
+          } else {
+            learnDomainFromUrl(resp.url);
+            const text = await resp.text();
+            if (text.length > 1000 && !text.includes("Just a moment") && !text.includes("Checking your browser")) {
+              console.log(`[Fetch] HTTP OK (${text.length} chars)`);
+              cacheSet(cache.page, url, text);
+              return text;
+            }
+          }
+        }
+      } catch (err) {
+        console.log(`[Fetch] HTTP error: ${err.message}`);
       }
+
+      // Brief pause before retry (let CF rate-limit clear)
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // ALL HTTP retries exhausted — last resort: browser
+    console.log(`[Fetch] All HTTP failed, browser fallback: ${url.substring(0, 80)}`);
+    const html = await browserFetch(url);
+    if (html && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
+      cacheSet(cache.page, url, html);
+      return html;
+    }
+    return null;
+  }
+
+  // Non-FaselHD URLs: simple fetch
+  for (let i = 0; i < retries; i++) {
+    try {
+      console.log(`[Fetch] (${i + 1}/${retries}) ${url}`);
+      const resp = await fetch(url, {
+        headers: { ...HEADERS, Referer: url },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const html = await resp.text();
 
       if (!html) throw new Error("Empty response");
 
       if (html.includes("Just a moment") || html.includes("Checking your browser")) {
         console.log("[Fetch] CF challenge — need browser");
-        cfCookies = ""; // invalidate cookies
+        cfCookies = "";
         continue;
       }
 
@@ -2013,7 +2024,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.11",
+  version: "1.0.12",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
