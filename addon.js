@@ -1290,7 +1290,8 @@ function buildSeasonUrl(showUrl, seasonNum) {
   if (!arabicName) return null;
   // Strip trailing slash
   const base = showUrl.replace(/\/$/, "");
-  return `${base}-الموسم-${arabicName}`;
+  // encodeURI so Arabic chars don't crash HTTP fetch
+  return encodeURI(`${base}-الموسم-${arabicName}`);
 }
 
 async function parseSeriesPage(url) {
@@ -1950,56 +1951,28 @@ async function resolve(imdbId, type, season, episode) {
     // Parse the first result's page for season/episode info
     let { seasons, episodes } = await parseSeriesPage(targetUrl);
 
-    // Only navigate to season page if we need a DIFFERENT season (season 1 is usually default)
+    // Navigate to season page — always use shortlinks (they redirect correctly)
     if (seasons.length > 0 && episodes.length === 0) {
       // No episodes on current page — need to navigate to season
       const match = seasons.find((s) => s.num === sn);
       if (match) {
-        // Try direct season URL first (works with fastFetch, no browser needed)
-        const directUrl = buildSeasonUrl(targetUrl, sn);
-        if (directUrl) {
-          console.log(`[Resolve] Season ${sn} direct: ${directUrl.substring(0, 80)}`);
-          const directPage = await parseSeriesPage(directUrl);
-          if (directPage.episodes.length > 0) {
-            episodes = directPage.episodes;
-          }
-        }
-        // Fall back to shortlink if direct URL didn't work
-        if (episodes.length === 0) {
-          console.log(`[Resolve] Season ${sn} shortlink: ${match.url}`);
-          const seasonPage = await parseSeriesPage(match.url);
-          episodes = seasonPage.episodes;
-        }
+        console.log(`[Resolve] Season ${sn}: ${match.url}`);
+        const seasonPage = await parseSeriesPage(match.url);
+        episodes = seasonPage.episodes;
       } else {
         console.log(`[Resolve] Season ${sn} not found in [${seasons.map((s) => s.num).join(",")}]`);
       }
     } else if (seasons.length > 1 && !pickedFromSearch) {
-      // Episodes shown but check if we're on the right season
+      // Episodes shown but may be wrong season — navigate to correct one
       const match = seasons.find((s) => s.num === sn);
       if (match) {
-        const activeMatch = seasons.find((s) => s.num === sn);
-        if (activeMatch && activeMatch.url !== targetUrl) {
-          // Try direct season URL first
-          const directUrl = buildSeasonUrl(targetUrl, sn);
-          let resolved = false;
-          if (directUrl) {
-            console.log(`[Resolve] Season ${sn} direct: ${directUrl.substring(0, 80)}`);
-            const directPage = await parseSeriesPage(directUrl);
-            if (directPage.episodes.length > 0) {
-              episodes = directPage.episodes;
-              resolved = true;
-            }
-          }
-          if (!resolved) {
-            console.log(`[Resolve] Season ${sn} shortlink: ${activeMatch.url}`);
-            const seasonPage = await parseSeriesPage(activeMatch.url);
-            if (seasonPage.episodes.length > 0) {
-              episodes = seasonPage.episodes;
-            } else {
-              console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
-              episodes = [];
-            }
-          }
+        console.log(`[Resolve] Season ${sn}: ${match.url}`);
+        const seasonPage = await parseSeriesPage(match.url);
+        if (seasonPage.episodes.length > 0) {
+          episodes = seasonPage.episodes;
+        } else {
+          console.log(`[Resolve] Season ${sn} page failed, clearing wrong-season episodes`);
+          episodes = [];
         }
       }
     } else if (pickedFromSearch && episodes.length > 0) {
