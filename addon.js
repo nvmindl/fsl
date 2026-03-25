@@ -26,7 +26,7 @@ const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium"
 let browserInstance = null;
 let browserLaunchPromise = null;
 let browserIdleTimer = null;
-const BROWSER_IDLE_MS = 60_000; // close browser after 60s idle
+const BROWSER_IDLE_MS = 5 * 60_000; // close browser after 5min idle (cold starts are expensive)
 
 function resetBrowserIdle() {
   if (browserIdleTimer) clearTimeout(browserIdleTimer);
@@ -177,7 +177,16 @@ async function ensureWorkerPage() {
   const domain = activeDomain || MAIN_DOMAIN;
 
   if (workerPage && !workerPage.isClosed() && workerDomain === domain) {
-    return workerPage;
+    // Verify the existing session isn't CF-blocked
+    try {
+      const check = await workerPage.content();
+      if (!check.includes("Just a moment") && !check.includes("Checking your browser") && check.length > 1000) {
+        return workerPage;
+      }
+      console.log("[Worker] Existing session is CF-blocked, re-opening...");
+    } catch {
+      console.log("[Worker] Existing session dead, re-opening...");
+    }
   }
 
   if (workerPage && !workerPage.isClosed()) {
@@ -189,14 +198,14 @@ async function ensureWorkerPage() {
   await workerPage.setUserAgent(UA);
   await workerPage.setViewport({ width: 1280, height: 720 });
 
-  await workerPage.goto(domain + "/", { waitUntil: "domcontentloaded", timeout: 25000 });
+  await workerPage.goto(domain + "/", { waitUntil: "domcontentloaded", timeout: 30000 });
 
   // Handle CF challenge on homepage
   const content = await workerPage.content();
   if (content.includes("Just a moment") || content.includes("Checking your browser")) {
     console.log("[Worker] CF challenge on homepage...");
     try {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 3000));
       for (const frame of workerPage.frames()) {
         const box = await frame.$('input[type="checkbox"], .cb-lb');
         if (box) { await box.click(); break; }
@@ -204,8 +213,28 @@ async function ensureWorkerPage() {
     } catch {}
     await workerPage.waitForFunction(
       () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
-      { timeout: 20000 }
-    ).catch(() => console.log("[Worker] CF did not resolve"));
+      { timeout: 35000 }
+    ).catch(() => console.log("[Worker] CF did not resolve after 35s"));
+
+    // Check if CF actually resolved
+    const afterCf = await workerPage.content();
+    if (afterCf.includes("Just a moment") || afterCf.includes("Checking your browser") || afterCf.length < 1000) {
+      console.log("[Worker] CF still blocking — trying reload...");
+      try {
+        await workerPage.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
+        await workerPage.waitForFunction(
+          () => !document.body.innerHTML.includes("Just a moment") && !document.body.innerHTML.includes("Checking your browser"),
+          { timeout: 15000 }
+        ).catch(() => {});
+      } catch {}
+      const final = await workerPage.content();
+      if (final.includes("Just a moment") || final.includes("Checking your browser") || final.length < 1000) {
+        console.log("[Worker] CF bypass FAILED — session unusable");
+        workerPage = null;
+        workerDomain = null;
+        return null;
+      }
+    }
   }
 
   workerDomain = domain;
@@ -217,6 +246,10 @@ async function ensureWorkerPage() {
 // Fetch a FaselHD page by navigating the worker tab (same CF session)
 async function workerNavigate(url, timeout = 20000) {
   const page = await ensureWorkerPage();
+  if (!page) {
+    console.log("[Worker] No worker page available");
+    return null;
+  }
   console.log(`[Worker] Navigating: ${url.substring(0, 80)}...`);
 
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
@@ -1017,6 +1050,11 @@ async function searchViaBrowser(query, domain) {
 
     // Use the worker page (has CF cookies) to execute AJAX POST from page context
     const page = await ensureWorkerPage();
+    if (!page) {
+      console.log("[BrowserSearch] Worker page unavailable (CF bypass failed)");
+      return [];
+    }
+
     const ajaxUrl = `${domain}/wp-admin/admin-ajax.php`;
 
     const html = await page.evaluate(async (url, q) => {
@@ -1037,6 +1075,7 @@ async function searchViaBrowser(query, domain) {
       ajaxBlockedUntil = 0;
       return parseSearchResults(html);
     }
+    console.log(`[BrowserSearch] In-page AJAX returned ${html ? html.length : 0} chars`);
 
     // Fallback to /search/ page navigation if in-page AJAX failed
     console.log(`[BrowserSearch] In-page AJAX failed, trying /search/ URL`);
@@ -1900,7 +1939,7 @@ async function resolve(imdbId, type, season, episode) {
 
 const manifest = {
   id: "community.faselhdx",
-  version: "1.0.7",
+  version: "1.0.8",
   name: "FaselHD",
   description:
     "Stream movies and TV shows from FaselHD — Arabic content with subtitles",
